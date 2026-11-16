@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ticketracer_test
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U ci" --health-interval 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 3s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://ci:ci@localhost:5432/ticketracer_test?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379/15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      # -p 1: packages share one test database; -race catches data races in handlers and the simulator
+      - run: go test -p 1 -race -count=1 ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Build images
+        run: |
+          docker build -t ticketracer-api ./backend
+          docker build -t ticketracer-web ./frontend
+      # boot the whole stack in demo mode and prove the guarantees under a short stampede
+      - name: Smoke + load test
+        run: |
+          cp .env.example .env
+          sed -i "s/=change-me/=ci-$(openssl rand -hex 12)/" .env
+          docker compose up -d --build --wait
+          curl -fsS http://localhost:8080/api/health
+          cd backend && go run ./cmd/loadtest -url http://localhost:8080 -users 1000 -concurrency 100 -stampede
+      - if: failure()
+        run: docker compose logs --tail 200

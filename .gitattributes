@@ -1,0 +1,3 @@
+# keep LF everywhere so Docker builds and Linux CI see the same bytes as Windows checkouts
+* text=auto eol=lf
+*.png binary

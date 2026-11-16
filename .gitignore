@@ -1,0 +1,20 @@
+﻿# secrets and local state
+.env
+*.local
+
+# Go / Node build output
+backend/bin/
+node_modules/
+frontend/dist/
+coverage/
+*.log
+
+# private development notes: kept locally, never published
+CLAUDE.md
+DESIGN.md
+LOADTEST.md
+PRODUCT.md
+SPEC.md
+progress.md
+tasks/
+.impeccable/
