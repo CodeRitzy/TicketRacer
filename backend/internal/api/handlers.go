@@ -4,18 +4,13 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
+	"ticketracer/internal/catalog"
 	"ticketracer/internal/queue"
 	"ticketracer/internal/store"
-)
-
-// The single V1 event.
-const (
-	eventName  = "Midnight Static — Live at The Foundry"
-	eventVenue = "The Foundry Hall"
-	eventDate  = "2027-03-12T20:00:00-05:00"
 )
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -30,17 +25,89 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// config is the booking rules that apply to every show.
 func (s *Server) config(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"event_name": eventName, "venue": eventVenue, "starts_at": eventDate,
-		"hold_ttl_seconds": int(s.cfg.HoldTTL.Seconds()), "max_seats": s.cfg.MaxSeatsPerHold,
-		"payment_mode": s.cfg.PaymentMode,
+		"hold_ttl_seconds": int(s.cfg.HoldTTL.Seconds()), "max_seats": s.cfg.MaxSeatsPerHold, "payment_mode": s.cfg.PaymentMode,
 	})
 }
 
-// joinQueue puts a fan in line. Rate limited per IP so one client cannot flood the line.
+// states lists every state with its time zone, for the picker and the browser's first guess.
+func (s *Server) states(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, catalog.States)
+}
+
+// venueView is the public part of a catalog venue.
+type venueView struct {
+	Name     string       `json:"name"`
+	City     string       `json:"city"`
+	State    string       `json:"state"`
+	Capacity int          `json:"capacity"`
+	Kind     catalog.Kind `json:"kind"`
+}
+
+func viewOf(v catalog.Venue) venueView {
+	return venueView{Name: v.Name, City: v.City, State: v.State, Capacity: v.Capacity, Kind: v.Kind}
+}
+
+// lineup returns a state's shows, creating the lineup on the first request for that state.
+func (s *Server) lineup(w http.ResponseWriter, r *http.Request) {
+	state, ok := catalog.StateByCode(r.URL.Query().Get("state"))
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "unknown state")
+		return
+	}
+	if err := s.st.EnsureLineup(r.Context(), state, false); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	shows, err := s.st.Lineup(r.Context(), state.Code)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	type item struct {
+		store.ShowSummary
+		Venue venueView `json:"venue"`
+	}
+	out := make([]item, 0, len(shows))
+	for _, sh := range shows {
+		v, _ := catalog.VenueByKey(sh.VenueKey)
+		out = append(out, item{sh, viewOf(v)})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"state": state, "shows": out})
+}
+
+// showDetail is everything the event page and seat picker need besides the seats themselves.
+func (s *Server) showDetail(w http.ResponseWriter, r *http.Request) {
+	id := showID(r)
+	sh, err := s.st.Show(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) || id <= 0 {
+		writeErr(w, http.StatusNotFound, "show not found")
+		return
+	} else if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	v, _ := catalog.VenueByKey(sh.VenueKey)
+	_, sections := catalog.Layout(v)
+	state, _ := catalog.StateByCode(sh.State)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": sh.ID, "act": sh.Act, "starts_at": sh.StartsAt, "zone": state.Zone, "venue": viewOf(v), "sections": sections,
+		"hold_ttl_seconds": int(s.cfg.HoldTTL.Seconds()), "max_seats": s.cfg.MaxSeatsPerHold, "payment_mode": s.cfg.PaymentMode,
+	})
+}
+
+// joinQueue puts a fan in a show's line. Rate limited per IP so one client cannot flood the line.
 func (s *Server) joinQueue(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, show := r.Context(), showID(r)
+	if _, err := s.st.Show(ctx, show); errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "show not found")
+		return
+	} else if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	admin := s.isAdmin(r)
 	if !admin {
 		ok, err := s.q.Allow(ctx, "join:"+clientIP(r), s.cfg.JoinRatePerMin)
@@ -55,27 +122,27 @@ func (s *Server) joinQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	// the simulator's stampede mode skips the line to hammer reservations directly
 	if admin && r.URL.Query().Get("skip") == "1" {
-		token, err := s.q.JoinAdmitted(ctx)
+		token, err := s.q.JoinAdmitted(ctx, show)
 		if err != nil {
 			s.fail(w, r, err)
 			return
 		}
-		s.q.Incr(ctx, "joined", 1)
-		s.q.Incr(ctx, "admitted", 1)
+		s.q.Incr(ctx, show, "joined", 1)
+		s.q.Incr(ctx, show, "admitted", 1)
 		writeJSON(w, http.StatusCreated, map[string]any{"token": token, "status": queue.Status{Admitted: true}})
 		return
 	}
-	token, st, err := s.q.Join(ctx)
+	token, st, err := s.q.Join(ctx, show)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	s.q.Incr(ctx, "joined", 1) // drives the dashboard pipeline
+	s.q.Incr(ctx, show, "joined", 1) // drives the dashboard pipeline
 	writeJSON(w, http.StatusCreated, map[string]any{"token": token, "status": st})
 }
 
 func (s *Server) queueStatus(w http.ResponseWriter, r *http.Request) {
-	st, err := s.q.Status(r.Context(), r.Header.Get("X-Queue-Token"))
+	st, err := s.q.Status(r.Context(), showID(r), r.Header.Get("X-Queue-Token"))
 	if errors.Is(err, queue.ErrUnknownToken) {
 		writeErr(w, http.StatusNotFound, "unknown or expired queue token")
 		return
@@ -86,9 +153,9 @@ func (s *Server) queueStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
-// queueLength is public: how many fans are in line right now (one ZCARD, no token needed).
+// queueLength is public: how many fans are in a show's line right now (one ZCARD, no token needed).
 func (s *Server) queueLength(w http.ResponseWriter, r *http.Request) {
-	n, err := s.q.Waiting(r.Context())
+	n, err := s.q.Waiting(r.Context(), showID(r))
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -96,22 +163,26 @@ func (s *Server) queueLength(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]int64{"waiting": n})
 }
 
-// seats serves the cached snapshot (at most 1s old) so polling never reaches Postgres.
+// seats serves the show's cached snapshot (at most 1s old) so polling rarely reaches Postgres.
 func (s *Server) seats(w http.ResponseWriter, r *http.Request) {
-	seats, err := s.live.snapshot(r.Context(), s.st)
+	seats, err := s.live.snapshot(r.Context(), s.st, showID(r))
 	if err != nil {
 		s.fail(w, r, err)
+		return
+	}
+	if len(seats) == 0 {
+		writeErr(w, http.StatusNotFound, "show not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, seats)
 }
 
-// createHold validates the request, checks the fan was admitted, then runs the
+// createHold validates the request, checks the fan was admitted to this show, then runs the
 // all-or-nothing reservation transaction.
 func (s *Server) createHold(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, show := r.Context(), showID(r)
 	token := r.Header.Get("X-Queue-Token")
-	if ok, err := s.q.Admitted(ctx, token); err != nil {
+	if ok, err := s.q.Admitted(ctx, show, token); err != nil {
 		s.fail(w, r, err)
 		return
 	} else if token == "" || !ok {
@@ -129,11 +200,18 @@ func (s *Server) createHold(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// either specific seats, or a quantity of general-admission tickets in one section
 	var body struct {
-		SeatIDs []int `json:"seat_ids"`
+		SeatIDs  []int  `json:"seat_ids"`
+		Section  string `json:"section"`
+		Quantity int    `json:"quantity"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.Section != "" {
+		s.createGAHold(w, r, show, token, body.Section, body.Quantity)
 		return
 	}
 	if n := len(body.SeatIDs); n == 0 || n > s.cfg.MaxSeatsPerHold {
@@ -150,30 +228,81 @@ func (s *Server) createHold(w http.ResponseWriter, r *http.Request) {
 	}
 	// cheap rejection: a seat already taken in the ≤1s-old snapshot cannot be won, so skip the DB.
 	// Correctness never depends on this; the transaction below is the real check.
-	if taken, err := s.live.anyTaken(ctx, s.st, body.SeatIDs); err != nil {
+	if taken, err := s.live.anyTaken(ctx, s.st, show, body.SeatIDs); err != nil {
 		s.fail(w, r, err)
 		return
 	} else if taken {
-		s.q.Incr(ctx, "reserve_conflicts", 1)
+		s.q.Incr(ctx, show, "reserve_conflicts", 1)
 		writeErr(w, http.StatusConflict, "some of those seats were just taken")
 		return
 	}
-	ttl := s.cfg.HoldTTL
-	// the simulator may shorten holds so expiry shows up within a short run (admin only, never longer)
-	if v, err := strconv.Atoi(r.Header.Get("X-Hold-TTL")); err == nil && s.isAdmin(r) && v > 0 && time.Duration(v)*time.Second < ttl {
-		ttl = time.Duration(v) * time.Second
-	}
-
-	hold, err := s.st.Reserve(ctx, token, body.SeatIDs, ttl)
+	hold, err := s.st.Reserve(ctx, show, token, body.SeatIDs, s.holdTTL(r))
 	if errors.Is(err, store.ErrConflict) {
-		s.q.Incr(ctx, "reserve_conflicts", 1)
+		s.q.Incr(ctx, show, "reserve_conflicts", 1)
 		writeErr(w, http.StatusConflict, "some of those seats were just taken")
 		return
 	} else if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	s.q.Incr(ctx, "reserve_ok", 1)
+	s.q.Incr(ctx, show, "reserve_ok", 1)
+	writeJSON(w, http.StatusCreated, hold)
+}
+
+// holdTTL is the configured hold, which the simulator (admin only) may shorten, never lengthen.
+func (s *Server) holdTTL(r *http.Request) time.Duration {
+	ttl := s.cfg.HoldTTL
+	if v, err := strconv.Atoi(r.Header.Get("X-Hold-TTL")); err == nil && s.isAdmin(r) && v > 0 && time.Duration(v)*time.Second < ttl {
+		ttl = time.Duration(v) * time.Second
+	}
+	return ttl
+}
+
+// createGAHold holds qty admissions to a general-admission section (pit, floor, lawn).
+func (s *Server) createGAHold(w http.ResponseWriter, r *http.Request, show int, token, section string, qty int) {
+	ctx := r.Context()
+	if qty < 1 || qty > s.cfg.MaxSeatsPerHold {
+		writeErr(w, http.StatusBadRequest, "choose between 1 and "+strconv.Itoa(s.cfg.MaxSeatsPerHold)+" tickets")
+		return
+	}
+	if !catalog.IsGA(section) {
+		writeErr(w, http.StatusBadRequest, "that section has reserved seats; choose seats instead")
+		return
+	}
+	// cheap rejection from the ≤1s-old snapshot: not enough left in the section
+	seats, err := s.live.snapshot(ctx, s.st, show)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	free, exists := 0, false
+	for _, x := range seats {
+		if x.Section == section {
+			exists = true
+			if x.Status == "available" {
+				free++
+			}
+		}
+	}
+	if !exists {
+		writeErr(w, http.StatusBadRequest, "no such section")
+		return
+	}
+	if free < qty {
+		s.q.Incr(ctx, show, "reserve_conflicts", 1)
+		writeErr(w, http.StatusConflict, "not enough tickets left in "+section)
+		return
+	}
+	hold, err := s.st.ReserveGA(ctx, show, token, section, qty, s.holdTTL(r))
+	if errors.Is(err, store.ErrConflict) {
+		s.q.Incr(ctx, show, "reserve_conflicts", 1)
+		writeErr(w, http.StatusConflict, "not enough tickets left in "+section)
+		return
+	} else if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.q.Incr(ctx, show, "reserve_ok", 1)
 	writeJSON(w, http.StatusCreated, hold)
 }
 
@@ -233,12 +362,50 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "too many checkout attempts, try again in a minute")
 		return
 	}
-	url, err := s.pay.Checkout(r.Context(), h, s.cfg.PublicURL)
+	title := "Ticketracer demo show"
+	if sh, err := s.st.Show(r.Context(), h.ShowID); err == nil {
+		v, _ := catalog.VenueByKey(sh.VenueKey)
+		title = sh.Act + " · " + v.Name
+	}
+	url, err := s.pay.Checkout(r.Context(), h, title, s.cfg.PublicURL)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"url": url})
+}
+
+var sessionRe = regexp.MustCompile(`^cs_(test|live)_[A-Za-z0-9]{10,200}$`)
+
+// reconcile confirms a payment from the Checkout Session the fan returned with (?session=cs_...),
+// for when the webhook is late or never arrives. It runs the same idempotent order transaction,
+// so a webhook landing later is a harmless duplicate. Only the hold's owner reaches this, the
+// session must belong to this hold, and lookups are rate limited per hold.
+func (s *Server) reconcile(r *http.Request, h store.Hold) bool {
+	ctx, session := r.Context(), r.URL.Query().Get("session")
+	if s.cfg.PaymentMode != "stripe" || !sessionRe.MatchString(session) {
+		return false
+	}
+	if ok, err := s.q.Allow(ctx, "sync:"+h.ID, 12); err != nil || !ok {
+		return false
+	}
+	ev, err := s.pay.Lookup(ctx, session)
+	if err != nil {
+		s.log.Warn("checkout session lookup failed", "hold", h.ID, "err", err)
+		return false
+	}
+	if ev.HoldID != h.ID || !ev.Paid {
+		return false // not this hold's session, or not paid yet
+	}
+	outcome, orderID, err := s.st.CompleteOrder(ctx, store.PaymentEvent{EventID: ev.ID, HoldID: ev.HoldID,
+		PaymentRef: ev.PaymentRef, SessionRef: ev.SessionRef, Email: ev.Email, AmountCents: ev.AmountCents})
+	if err != nil {
+		s.log.Error("reconcile failed", "hold", h.ID, "err", err)
+		return false
+	}
+	s.q.Incr(ctx, h.ShowID, "webhook_"+string(outcome), 1)
+	s.log.Info("payment confirmed from checkout session", "hold", h.ID, "outcome", outcome, "order", orderID)
+	return true
 }
 
 // getOrder is polled by the confirmation page until the webhook has been processed.
@@ -248,12 +415,16 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	o, err := s.st.OrderByHold(r.Context(), h.ID)
+	// no order yet but the fan came back from checkout: confirm with the provider directly
+	if errors.Is(err, store.ErrNotFound) && s.reconcile(r, h) {
+		o, err = s.st.OrderByHold(r.Context(), h.ID)
+	}
 	if errors.Is(err, store.ErrNotFound) {
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "processing", "hold_status": h.Status})
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "processing", "hold_status": h.Status, "show_id": h.ShowID})
 		return
 	} else if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, o)
+	writeJSON(w, http.StatusOK, map[string]any{"order": o, "show_id": h.ShowID})
 }

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,12 +48,15 @@ func (s *Server) Routes() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("GET /api/health", s.health)
 	m.HandleFunc("GET /api/config", s.config)
-	m.HandleFunc("POST /api/queue/join", s.joinQueue)
-	m.HandleFunc("GET /api/queue/status", s.queueStatus)
-	m.HandleFunc("GET /api/queue/length", s.queueLength)
-	m.HandleFunc("GET /api/seats", s.seats)
-	m.HandleFunc("GET /api/seats/stream", s.seatStream)
-	m.HandleFunc("POST /api/holds", s.createHold)
+	m.HandleFunc("GET /api/states", s.states)
+	m.HandleFunc("GET /api/shows", s.lineup)
+	m.HandleFunc("GET /api/shows/{show}", s.showDetail)
+	m.HandleFunc("POST /api/shows/{show}/queue/join", s.withShow(s.joinQueue))
+	m.HandleFunc("GET /api/shows/{show}/queue/status", s.withShow(s.queueStatus))
+	m.HandleFunc("GET /api/shows/{show}/queue/length", s.withShow(s.queueLength))
+	m.HandleFunc("GET /api/shows/{show}/seats", s.withShow(s.seats))
+	m.HandleFunc("GET /api/shows/{show}/seats/stream", s.withShow(s.seatStream))
+	m.HandleFunc("POST /api/shows/{show}/holds", s.withShow(s.createHold))
 	m.HandleFunc("GET /api/holds/{id}", s.getHold)
 	m.HandleFunc("DELETE /api/holds/{id}", s.cancelHold)
 	m.HandleFunc("POST /api/holds/{id}/checkout", s.checkout)
@@ -61,6 +65,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("POST /api/webhooks/stripe", s.stripeWebhook)
 	m.HandleFunc("GET /api/admin/stats", s.admin(s.stats))
 	m.HandleFunc("POST /api/admin/reset", s.admin(s.reset))
+	m.HandleFunc("POST /api/admin/lineup", s.admin(s.regenerate))
 	m.HandleFunc("POST /api/admin/simulate", s.admin(s.startSim))
 	return s.middleware(m)
 }
@@ -85,7 +90,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		h.Set("Cache-Control", "no-store")
 		sw := &statusWriter{ResponseWriter: w, code: 200}
 		next.ServeHTTP(sw, r)
-		if p := r.URL.Path; p != "/api/queue/status" && p != "/api/queue/length" && p != "/api/seats" { // skip high-volume polling paths
+		if p := r.URL.Path; !strings.HasSuffix(p, "/queue/status") && !strings.HasSuffix(p, "/queue/length") && !strings.HasSuffix(p, "/seats") { // skip high-volume polling paths
 			s.log.Info("http", "method", r.Method, "path", r.URL.Path, "status", sw.code, "ms", time.Since(start).Milliseconds())
 		}
 	})
@@ -124,6 +129,25 @@ func clientIP(r *http.Request) string {
 	}
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	return host
+}
+
+// withShow rejects a malformed show id before the handler runs; handlers read it with showID.
+func (s *Server) withShow(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if showID(r) <= 0 {
+			writeErr(w, http.StatusNotFound, "show not found")
+			return
+		}
+		h(w, r)
+	}
+}
+
+func showID(r *http.Request) int {
+	n, err := strconv.Atoi(r.PathValue("show"))
+	if err != nil || n > 1<<30 {
+		return 0
+	}
+	return n
 }
 
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -178,9 +202,9 @@ func (s *Server) RunBackground(ctx context.Context) {
 	})
 	// release expired holds
 	every(2*time.Second, "sweep", func(ctx context.Context) error {
-		n, err := s.st.SweepExpired(ctx)
-		if n > 0 {
-			s.q.Incr(ctx, "seats_released_expired", int64(n))
+		freed, err := s.st.SweepExpired(ctx)
+		for show, n := range freed {
+			s.q.Incr(ctx, show, "seats_released_expired", int64(n))
 		}
 		return err
 	})
@@ -200,7 +224,7 @@ func (s *Server) processRefunds(ctx context.Context) error {
 		if err := s.st.MarkRefunded(ctx, o.ID); err != nil {
 			return err
 		}
-		s.q.Incr(ctx, "refunds_issued", 1)
+		s.q.Incr(ctx, 0, "refunds_issued", 1)
 		s.log.Info("refund issued", "order", o.ID)
 	}
 	return err

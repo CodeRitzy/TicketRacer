@@ -3,25 +3,39 @@ package api
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
+	"ticketracer/internal/catalog"
 	"ticketracer/internal/sim"
 )
 
-// stats feeds the dashboard: database truth, shared counters, queue length and simulator state.
+// queryShow reads ?show=N; 0 (or absent) means every show.
+func queryShow(r *http.Request) int {
+	n, _ := strconv.Atoi(r.URL.Query().Get("show"))
+	return max(n, 0)
+}
+
+// stats feeds the dashboard: database truth, shared counters, queue length and simulator state,
+// for one show or for all of them.
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	db, err := s.st.Stats(ctx)
+	ctx, show := r.Context(), queryShow(r)
+	db, err := s.st.Stats(ctx, show)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	metrics, err := s.q.Metrics(ctx)
+	metrics, err := s.q.Metrics(ctx, show)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	waiting, err := s.q.Waiting(ctx)
+	var waiting int64
+	if show > 0 {
+		waiting, err = s.q.Waiting(ctx, show)
+	} else {
+		waiting, err = s.q.WaitingAll(ctx)
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -40,25 +54,31 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	s.simMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"db": db, "metrics": metrics, "waiting": waiting, "sim": simState,
+		"show": show, "db": db, "metrics": metrics, "waiting": waiting, "sim": simState,
 		"payment_mode": s.cfg.PaymentMode, "time": time.Now().UTC(),
 	})
 }
 
-// reset clears bookings and the queue. Refused while a simulation runs.
-func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
+func (s *Server) simBusy(w http.ResponseWriter) bool {
 	s.simMu.Lock()
-	running := s.simRunning
-	s.simMu.Unlock()
-	if running {
+	defer s.simMu.Unlock()
+	if s.simRunning {
 		writeErr(w, http.StatusConflict, "a simulation is running")
+	}
+	return s.simRunning
+}
+
+// reset clears bookings, the line and counters of one show (?show=N) or of all shows.
+func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
+	if s.simBusy(w) {
 		return
 	}
-	if err := s.st.Reset(r.Context()); err != nil {
+	show := queryShow(r)
+	if err := s.st.Reset(r.Context(), show); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	if err := s.q.Reset(r.Context()); err != nil {
+	if err := s.q.Reset(r.Context(), show); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -66,7 +86,24 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// startSim launches one simulation in the background; only one may run at a time.
+// regenerate replaces a state's lineup with six new shows (?state=XX).
+func (s *Server) regenerate(w http.ResponseWriter, r *http.Request) {
+	if s.simBusy(w) {
+		return
+	}
+	state, ok := catalog.StateByCode(r.URL.Query().Get("state"))
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "unknown state")
+		return
+	}
+	if err := s.st.EnsureLineup(r.Context(), state, true); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// startSim launches one simulation against one show in the background; only one may run at a time.
 func (s *Server) startSim(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.DemoWebhookSecret == "" {
 		writeErr(w, http.StatusConflict, "simulator needs DEMO_WEBHOOK_SECRET")
@@ -75,6 +112,10 @@ func (s *Server) startSim(w http.ResponseWriter, r *http.Request) {
 	var cfg sim.Config
 	if err := decode(r, &cfg); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if _, err := s.st.Show(r.Context(), cfg.ShowID); err != nil {
+		writeErr(w, http.StatusBadRequest, "choose an existing show")
 		return
 	}
 	cfg.BaseURL, cfg.AdminToken = s.cfg.SelfURL, s.cfg.AdminToken
@@ -100,7 +141,7 @@ func (s *Server) startSim(w http.ResponseWriter, r *http.Request) {
 		s.simMu.Lock()
 		s.simRunning, s.simReport = false, &rep
 		s.simMu.Unlock()
-		s.log.Info("simulation finished", "users", cfg.Users, "seconds", rep.DurationSec)
+		s.log.Info("simulation finished", "show", cfg.ShowID, "users", cfg.Users, "seconds", rep.DurationSec)
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "started"})
 }

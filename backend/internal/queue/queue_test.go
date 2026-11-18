@@ -33,7 +33,7 @@ func TestAdmitsInArrivalOrder(t *testing.T) {
 	q, ctx := testQueue(t), context.Background()
 	tokens := make([]string, 5)
 	for i := range tokens {
-		tok, st, err := q.Join(ctx)
+		tok, st, err := q.Join(ctx, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -46,7 +46,7 @@ func TestAdmitsInArrivalOrder(t *testing.T) {
 		t.Fatalf("admitted %d (err %v), want 2", n, err)
 	}
 	for i, tok := range tokens {
-		st, err := q.Status(ctx, tok)
+		st, err := q.Status(ctx, 1, tok)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -59,11 +59,30 @@ func TestAdmitsInArrivalOrder(t *testing.T) {
 	}
 }
 
-// Only one admission batch per second, however many instances call AdmitTick.
+// Two shows have independent lines: admission to one is no admission to the other.
+func TestShowsHaveIndependentLines(t *testing.T) {
+	q, ctx := testQueue(t), context.Background()
+	a, _, _ := q.Join(ctx, 1)
+	b, st, _ := q.Join(ctx, 2)
+	if st.Position != 1 {
+		t.Fatalf("first fan of show 2 is at position %d", st.Position)
+	}
+	if n, _ := q.AdmitTick(ctx, 5); n != 2 {
+		t.Fatalf("admitted %d across two shows, want 2", n)
+	}
+	if ok, _ := q.Admitted(ctx, 2, a); ok {
+		t.Fatal("a show-1 token was admitted to show 2")
+	}
+	if ok, _ := q.Admitted(ctx, 2, b); !ok {
+		t.Fatal("show-2 fan not admitted")
+	}
+}
+
+// Only one admission batch per show per second, however many instances call AdmitTick.
 func TestAdmitTickOncePerSecond(t *testing.T) {
 	q, ctx := testQueue(t), context.Background()
 	for range 10 {
-		q.Join(ctx)
+		q.Join(ctx, 1)
 	}
 	// align to the start of a second so both calls share one slot
 	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second)))
@@ -76,8 +95,10 @@ func TestAdmitTickOncePerSecond(t *testing.T) {
 
 func TestUnknownToken(t *testing.T) {
 	q := testQueue(t)
-	if _, err := q.Status(context.Background(), "nope"); err != ErrUnknownToken {
-		t.Fatalf("got %v, want ErrUnknownToken", err)
+	for _, tok := range []string{"nope", "0123456789abcdef0123456789abcdef"} {
+		if _, err := q.Status(context.Background(), 1, tok); err != ErrUnknownToken {
+			t.Fatalf("%q: got %v, want ErrUnknownToken", tok, err)
+		}
 	}
 }
 

@@ -24,7 +24,7 @@ func (s *Server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 	// demo-signed events are accepted only while DEMO_WEBHOOK_SECRET is set; unset it in production
 	ev, err := pay.ParseEvent(payload, r.Header.Get("Stripe-Signature"), s.cfg.StripeWebhookSecret, s.cfg.DemoWebhookSecret)
 	if err != nil {
-		s.q.Incr(ctx, "webhook_rejected", 1)
+		s.q.Incr(ctx, 0, "webhook_rejected", 1)
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -45,7 +45,11 @@ func (s *Server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, err) // rolled back; Stripe will retry
 			return
 		}
-		s.q.Incr(ctx, "webhook_"+string(outcome), 1)
+		show := 0 // count per show when the hold exists
+		if h, err := s.st.Hold(ctx, ev.HoldID); err == nil {
+			show = h.ShowID
+		}
+		s.q.Incr(ctx, show, "webhook_"+string(outcome), 1)
 		if outcome == store.OutcomeSecondPayment {
 			s.log.Error("second payment for an already-paid hold: refund manually", "hold", ev.HoldID, "payment", ev.PaymentRef)
 		}

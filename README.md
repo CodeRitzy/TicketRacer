@@ -2,12 +2,12 @@
 
 **A ticketing system that prevents overselling when thousands of people compete for limited seats.**
 
-Fans enter a waiting room, pick seats on a live split-flap seat map, hold them for 10 minutes, and pay with Stripe (test mode). PostgreSQL decides every hold, so a seat can never be sold twice. Abandoned holds go back on sale automatically, and a payment webhook delivered five times still creates exactly one order. An operator dashboard shows the request pipeline live and includes a traffic simulator that tries to break all of this.
+Visitors see six upcoming shows at **real venues in their state**, with invented acts and real capacities and seating sections. They join that show's waiting room, then pick seats in a ticket-site style picker: venue overview, sections with prices, quantity, *Best available*, and a live seat grid. General-admission areas (floor, pit, lawn) are sold as admission by quantity, with no seat to choose, as on Ticketmaster and AXS. Seats are held for 10 minutes while the fan pays with Stripe (test mode). PostgreSQL decides every hold, so a seat can never be sold twice. Abandoned holds go back on sale automatically, and a payment webhook delivered five times still creates exactly one order. An operator dashboard shows the request pipeline live and includes a traffic simulator that tries to break all of this.
 
 | | |
 |---|---|
 | Stack | React 19 + TypeScript (Vite) · Go 1.27 · PostgreSQL 17 · Redis 7 · Stripe (test mode) · Docker Compose |
-| Proof | 22 Go tests (integration + config), 9 frontend tests, CI with `-race`, a measured 2,000-fan stampede with **0 oversold seats and 0 duplicate orders** |
+| Proof | 31 Go tests (integration, catalog, config), 19 frontend tests, CI with `-race`, a measured 2,000-fan stampede with **0 oversold seats and 0 duplicate orders** |
 
 ---
 
@@ -20,8 +20,8 @@ cp .env.example .env          # then replace every "change-me" with a random val
 docker compose up --build     # http://localhost:8080
 ```
 
-- **Book:** open http://localhost:8080, then *Join the queue* → pick seats → *Hold* → *Pay*.
-- **Dashboard:** http://localhost:8080/dashboard. Paste `ADMIN_TOKEN` from your `.env` and press *Release 2,000 fans*.
+- **Book:** open http://localhost:8080. Your state is pre-selected from your device's time zone, and you can change it. Pick a show → *Join the queue* → choose a section or *Best available* → *Hold* → *Pay*.
+- **Dashboard:** on any show page, click *Watch it under load*. It opens the dashboard on that show (paste `ADMIN_TOKEN` from your `.env` the first time), then press *Release 2,000 fans*. `/dashboard` on its own shows totals across every show.
 - Each browser tab is its own fan, so open two tabs to watch them compete for the same seats.
 
 ### Payments: demo mode or Stripe test mode
@@ -34,7 +34,7 @@ To use real Stripe Checkout in test mode:
 2. Forward webhooks to your machine and copy the secret it prints into `STRIPE_WEBHOOK_SECRET`:
    ```bash
    stripe login
-   stripe listen --forward-to localhost:8080/api/webhooks/stripe
+   stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.expired --forward-to localhost:8080/api/webhooks/stripe
    ```
 3. Run `docker compose up -d --build api`, then pay with card `4242 4242 4242 4242`, any future date and any CVC.
 
@@ -57,12 +57,13 @@ flowchart LR
 
 | Piece | What it does |
 |---|---|
-| `backend/internal/store` | All PostgreSQL access: the schema, the all-or-nothing reserve, expiry sweep, idempotent order completion, stats and invariants |
+| `backend/internal/catalog` | Reference data compiled in: all 50 states + DC, ~110 real venues (capacity, seating sections, source link), price tiers, seat layouts, invented-act generator |
+| `backend/internal/store` | All PostgreSQL access: the schema, per-state lineups, the all-or-nothing reserve, expiry sweep, idempotent order completion, stats and invariants (per show) |
 | `backend/internal/queue` | Redis waiting room (sorted set + atomic Lua admission), per-IP rate limit, shared counters |
 | `backend/internal/pay` | Stripe Checkout + refunds (with idempotency keys), demo provider, webhook signature verification |
 | `backend/internal/api` | HTTP handlers, middleware, Server-Sent Events seat stream, admin + simulator endpoints |
 | `backend/internal/sim` | Traffic simulator used by both the dashboard and `cmd/loadtest`. It talks HTTP to the real API |
-| `frontend/src` | Booking flow, confirmation, dashboard with the live pipeline visualizer |
+| `frontend/src` | Shows near you, event page, seat picker (venue map, sections, Best available), confirmation, dashboard with the live pipeline visualizer |
 
 ### The guarantees and where they live
 
@@ -83,6 +84,8 @@ If fewer rows change than seats were requested, the transaction rolls back and t
 2. `SELECT … FROM holds … FOR UPDATE` serializes the payment against expiry.
 3. `orders.hold_id UNIQUE` and `orders.payment_ref UNIQUE` are two more independent guards.
 4. Any failure rolls back all of it and returns `500`, so Stripe retries.
+
+**3b. A payment confirms even if the webhook never arrives.** Stripe returns the fan to `/confirmation?hold=…&session={CHECKOUT_SESSION_ID}`. If no order exists yet, the server retrieves that Checkout Session from Stripe, checks that it belongs to this hold and is paid, and runs the same idempotent order transaction. A webhook that lands later is then a harmless duplicate.
 
 **4. Money is never taken without seats.** The amount is checked against **our** database, never the webhook body. A payment for an expired hold or for the wrong amount becomes `refund_pending`. A background loop refunds it through Stripe with an idempotency key, so retries can never refund twice.
 
@@ -120,7 +123,12 @@ What the backend suite covers:
 | `TestWebhookRejectsBadSignature` | Missing, garbage and wrong-secret signatures all get `400` and no order |
 | `TestAdmitsInArrivalOrder` / `TestAdmitTickOncePerSecond` | FIFO admission at a constant rate across instances |
 | `TestAdminRequiresToken`, `TestHoldRequiresAdmission`, `TestHoldIsPrivateToOwner`, `TestHoldValidation`, `TestDemoPayLockedDownInStripeMode` | Access control and input validation |
+| `TestReturnFromCheckoutConfirmsWithoutWebhook` | Returning from Stripe confirms the order without the webhook; another hold's session is ignored; the late webhook is a duplicate |
+| `TestReserveGANeverOversells` | 60 fans racing for general-admission floor tickets never oversell, and every winner gets exactly their quantity |
 | `TestLoadRejectsWeakSecrets` | The server refuses to start with placeholder or short admin/webhook secrets |
+| `TestHoldsCannotCrossShows` / `TestShowsHaveIndependentLines` | Seat 5 of one show is not seat 5 of another; admission to one show is not admission to another |
+| `TestLineupCreatedOnce` | Ten simultaneous first visitors to a state create exactly one six-show lineup |
+| `TestCatalogCoverage` / `TestLayout` / `TestLineup` | Every state has venues; layouts are 200–600 seats with front sections priced highest; lineups are distinct evening shows |
 
 > **Windows tip:** if `npm test` reports `Cannot read properties of undefined (reading 'config')`, your terminal opened the folder as lowercase `c:\…`. Run it from a path starting with `C:\`. This is a Vitest drive-letter quirk.
 
@@ -128,7 +136,8 @@ What the backend suite covers:
 
 ```bash
 docker compose up -d --build
-cd backend && go run ./cmd/loadtest -url http://localhost:8080 -users 2000 -concurrency 200 -stampede
+cd backend && go run ./cmd/loadtest -url http://localhost:8080 -state CA -users 2000 -concurrency 200 -stampede
+# -show N targets one show; otherwise the largest show in -state is used
 ```
 
 It resets the event, prints a Markdown report (throughput, latency percentiles, conflicts), and exits non-zero if any invariant fails.
@@ -174,7 +183,8 @@ It resets the event, prints a Markdown report (throughput, latency percentiles, 
 
 Other V1 limits:
 - There are no user accounts; the queue token is the fan's identity.
-- There is one event and one seating layout.
+- Venue facts (capacity, sections) are the commonly cited figures with a source link per venue in `backend/internal/catalog/venues.go`; seat maps are representative, not seat-by-seat replicas, and demo shows sell a scaled block of 200–600 seats.
+- Prices are typical ranges for the venue type (anchored on Pollstar 2025 averages), not real ticket prices.
 - Refunds retry until they succeed, but nothing alerts on repeated failures.
 - A second, *different* payment for an already-paid hold is logged as `second_payment` for a manual refund rather than refunded automatically. This can only happen across separate checkout sessions, because repeat clicks reuse one session.
 - `X-Real-IP` is trusted because only nginx can reach the API.
@@ -182,7 +192,7 @@ Other V1 limits:
 ## Project layout
 
 ```
-backend/   cmd/api · cmd/loadtest · internal/{config,store,queue,pay,api,sim}
+backend/   cmd/api · cmd/loadtest · internal/{catalog,config,store,queue,pay,api,sim}
 frontend/  src/{api.ts, lib/, components/, pages/} · nginx.conf
 docker-compose.yml · .github/workflows/ci.yml
 ```

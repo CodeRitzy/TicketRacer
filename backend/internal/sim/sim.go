@@ -18,6 +18,7 @@ import (
 
 // Config describes one simulation run.
 type Config struct {
+	ShowID       int     `json:"show_id"`
 	BaseURL      string  `json:"-"`
 	AdminToken   string  `json:"-"`
 	Users        int     `json:"users"`
@@ -88,7 +89,7 @@ func Run(ctx context.Context, cfg Config, p *Progress) (Report, error) {
 	var stats struct {
 		DB map[string]any `json:"db"`
 	}
-	if err := r.do(ctx, "GET", "/api/admin/stats", "", nil, &stats); err == nil {
+	if err := r.do(ctx, "GET", "/api/admin/stats?show="+strconv.Itoa(r.cfg.ShowID), "", nil, &stats); err == nil {
 		rep.Invariants = stats.DB
 	}
 	return rep, ctx.Err()
@@ -98,7 +99,7 @@ func Run(ctx context.Context, cfg Config, p *Progress) (Report, error) {
 func (r *runner) fan(ctx context.Context) {
 	r.p.Users.Add(1)
 	var join struct{ Token string }
-	path := "/api/queue/join"
+	path := r.show("/queue/join")
 	if r.cfg.Stampede {
 		path += "?skip=1"
 	}
@@ -113,34 +114,41 @@ func (r *runner) fan(ctx context.Context) {
 
 	abandon := rand.Float64() < r.cfg.AbandonPct
 	var hold struct{ ID string }
-	for attempt := 0; ; attempt++ {
-		ids, ok := r.pickSeats(ctx, join.Token)
+	// Like real fans refreshing a sold-out page, a fan who finds nothing free keeps watching for as
+	// long as anyone still holds seats: every hold ends paid or expired, and an expired hold puts
+	// seats back for a waiting fan. A fan gives up only when nothing is free and nothing is held
+	// (truly sold out). The run's own deadline (ctx) still bounds the wait.
+	for {
+		ids, held, ok := r.pickSeats(ctx, join.Token)
 		if !ok {
-			r.p.SoldOut.Add(1)
-			return
+			if held == 0 || ctx.Err() != nil {
+				r.p.SoldOut.Add(1)
+				return
+			}
+			select { // nothing free right now, but holds may still expire
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second + rand.N(2*time.Second)):
+			}
+			continue
 		}
 		ttl := ""
 		if abandon {
 			ttl = strconv.Itoa(r.cfg.AbandonTTL)
 		}
 		t := time.Now()
-		err := r.do(ctx, "POST", "/api/holds", join.Token, map[string]any{"seat_ids": ids}, &hold, "X-Hold-TTL", ttl)
+		err := r.do(ctx, "POST", r.show("/holds"), join.Token, map[string]any{"seat_ids": ids}, &hold, "X-Hold-TTL", ttl)
 		r.mu.Lock()
 		r.lat = append(r.lat, time.Since(t))
 		r.mu.Unlock()
 		if err == nil {
 			break
 		}
-		if he, ok := err.(httpError); ok && he.code == http.StatusConflict && attempt < 4 {
+		if he, ok := err.(httpError); ok && he.code == http.StatusConflict {
 			r.p.Conflicts.Add(1) // someone else won those seats; look again
 			continue
 		}
-		if he, ok := err.(httpError); ok && he.code == http.StatusConflict {
-			r.p.Conflicts.Add(1)
-			r.p.SoldOut.Add(1)
-		} else {
-			r.p.Errors.Add(1)
-		}
+		r.p.Errors.Add(1)
 		return
 	}
 	r.p.Holds.Add(1)
@@ -164,7 +172,7 @@ func (r *runner) fan(ctx context.Context) {
 func (r *runner) waitAdmitted(ctx context.Context, token string) bool {
 	for {
 		var st struct{ Admitted bool }
-		if err := r.do(ctx, "GET", "/api/queue/status", token, nil, &st); err != nil {
+		if err := r.do(ctx, "GET", r.show("/queue/status"), token, nil, &st); err != nil {
 			r.p.Errors.Add(1)
 			return false
 		}
@@ -180,23 +188,26 @@ func (r *runner) waitAdmitted(ctx context.Context, token string) bool {
 }
 
 // pickSeats chooses 1..MaxSeats free seats, biased toward the front rows like real fans,
-// which is what creates contention.
-func (r *runner) pickSeats(ctx context.Context, token string) ([]int, bool) {
+// which is what creates contention. It also reports how many seats other fans are holding.
+func (r *runner) pickSeats(ctx context.Context, token string) (ids []int, held int, ok bool) {
 	var seats []struct {
 		ID     int
 		Status string
 	}
-	if err := r.do(ctx, "GET", "/api/seats", token, nil, &seats); err != nil {
-		return nil, false
+	if err := r.do(ctx, "GET", r.show("/seats"), token, nil, &seats); err != nil {
+		return nil, 0, false
 	}
 	free := make([]int, 0, len(seats))
 	for _, s := range seats {
-		if s.Status == "available" {
+		switch s.Status {
+		case "available":
 			free = append(free, s.ID)
+		case "held":
+			held++
 		}
 	}
 	if len(free) == 0 {
-		return nil, false
+		return nil, held, false
 	}
 	want := min(1+rand.N(r.cfg.MaxSeats), len(free))
 	picked := map[int]bool{}
@@ -204,12 +215,15 @@ func (r *runner) pickSeats(ctx context.Context, token string) ([]int, bool) {
 		x := rand.Float64()
 		picked[free[int(x*x*float64(len(free)))]] = true // x² skews toward low ids (front rows)
 	}
-	ids := make([]int, 0, want)
+	ids = make([]int, 0, want)
 	for id := range picked {
 		ids = append(ids, id)
 	}
-	return ids, true
+	return ids, held, true
 }
+
+// show builds a path under this run's show.
+func (r *runner) show(p string) string { return "/api/shows/" + strconv.Itoa(r.cfg.ShowID) + p }
 
 type httpError struct{ code int }
 

@@ -29,7 +29,9 @@ func main() {
 	flag.Float64Var(&cfg.DuplicatePct, "dup", 0.3, "share of payments whose webhook is delivered 3 times")
 	flag.IntVar(&cfg.MaxSeats, "max-seats", 4, "seats per fan, 1..n")
 	flag.IntVar(&cfg.AbandonTTL, "abandon-ttl", 15, "hold seconds for abandoned holds")
-	reset := flag.Bool("reset", true, "reset bookings before the run")
+	flag.IntVar(&cfg.ShowID, "show", 0, "show id to attack (0: the largest show in -state)")
+	state := flag.String("state", "CA", "state whose largest show is used when -show is 0")
+	reset := flag.Bool("reset", true, "reset the show's bookings before the run")
 	asJSON := flag.Bool("json", false, "print the raw JSON report")
 	flag.Parse()
 	if cfg.AdminToken == "" {
@@ -39,8 +41,16 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	if cfg.ShowID == 0 {
+		id, err := largestShow(ctx, cfg.BaseURL, *state)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "could not pick a show:", err)
+			os.Exit(1)
+		}
+		cfg.ShowID = id
+	}
 	if *reset {
-		req, _ := http.NewRequestWithContext(ctx, "POST", cfg.BaseURL+"/api/admin/reset", nil)
+		req, _ := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/admin/reset?show=%d", cfg.BaseURL, cfg.ShowID), nil)
 		req.Header.Set("Authorization", "Bearer "+cfg.AdminToken)
 		res, err := http.DefaultClient.Do(req)
 		if err != nil || res.StatusCode != http.StatusNoContent {
@@ -50,7 +60,7 @@ func main() {
 		res.Body.Close()
 	}
 
-	fmt.Fprintf(os.Stderr, "running %d fans (concurrency %d, stampede=%v)...\n", cfg.Users, cfg.Concurrency, cfg.Stampede)
+	fmt.Fprintf(os.Stderr, "running %d fans against show %d (concurrency %d, stampede=%v)...\n", cfg.Users, cfg.ShowID, cfg.Concurrency, cfg.Stampede)
 	rep, err := sim.Run(ctx, cfg, &sim.Progress{})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "run interrupted:", err)
@@ -71,6 +81,29 @@ func main() {
 	}
 }
 
+// largestShow returns the id of the show with the most seats in a state (creating the lineup if needed).
+func largestShow(ctx context.Context, base, state string) (int, error) {
+	req, _ := http.NewRequestWithContext(ctx, "GET", base+"/api/shows?state="+state, nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+	var body struct {
+		Shows []struct{ ID, Available, Held, Sold int }
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil || len(body.Shows) == 0 {
+		return 0, fmt.Errorf("no shows for %s (%v)", state, err)
+	}
+	best, size := 0, -1
+	for _, sh := range body.Shows {
+		if n := sh.Available + sh.Held + sh.Sold; n > size {
+			best, size = sh.ID, n
+		}
+	}
+	return best, nil
+}
+
 func statusOf(res *http.Response) string {
 	if res == nil {
 		return ""
@@ -79,8 +112,8 @@ func statusOf(res *http.Response) string {
 }
 
 func printMarkdown(r sim.Report) {
-	fmt.Printf("Run: %s · %d fans · concurrency %d · stampede=%v · abandon %.0f%% · duplicate webhooks %.0f%%\n\n",
-		time.Now().Format("2006-01-02 15:04 MST"), r.Config.Users, r.Config.Concurrency, r.Config.Stampede, r.Config.AbandonPct*100, r.Config.DuplicatePct*100)
+	fmt.Printf("Run: %s · show %d · %d fans · concurrency %d · stampede=%v · abandon %.0f%% · duplicate webhooks %.0f%%\n\n",
+		time.Now().Format("2006-01-02 15:04 MST"), r.Config.ShowID, r.Config.Users, r.Config.Concurrency, r.Config.Stampede, r.Config.AbandonPct*100, r.Config.DuplicatePct*100)
 	fmt.Printf("| Metric | Value |\n|---|---|\n| Duration | %.2f s |\n| HTTP requests | %d |\n| Throughput | %.0f req/s |\n",
 		r.DurationSec, r.Requests, r.RequestsPerSec)
 	for _, k := range []string{"p50", "p95", "p99", "max"} {

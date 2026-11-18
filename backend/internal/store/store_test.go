@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"ticketracer/internal/catalog"
 )
 
 // testStore connects to TEST_DATABASE_URL and resets it. Tests are skipped when it is unset.
@@ -24,15 +26,28 @@ func testStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
-	if err := s.Reset(context.Background()); err != nil {
+	if err := s.Reset(context.Background(), 0); err != nil {
 		t.Fatal(err)
 	}
+	// every test gets a fresh 200-seat show (a 4,000-capacity theater scales to 200 seats)
+	sh, err := s.CreateShow(context.Background(), "TS", testPlan())
+	if err != nil {
+		t.Fatal(err)
+	}
+	testShow = sh.ID
 	return s
+}
+
+// testShow is the show the current test books against (tests in a package run one at a time).
+var testShow int
+
+func testPlan() catalog.Plan {
+	return catalog.Plan{Venue: catalog.Venue{Key: "test-hall", Capacity: 4000, Kind: catalog.Theater}, Act: "The Test Pattern", StartsAt: time.Now().Add(720 * time.Hour)}
 }
 
 func assertInvariants(t *testing.T, s *Store) Stats {
 	t.Helper()
-	st, err := s.Stats(context.Background())
+	st, err := s.Stats(context.Background(), testShow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +69,7 @@ func TestReserveRaceSingleSeat(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := s.Reserve(ctx, fmt.Sprintf("fan-%d", i), []int{5}, time.Minute)
+			_, err := s.Reserve(ctx, testShow, fmt.Sprintf("fan-%d", i), []int{5}, time.Minute)
 			switch {
 			case err == nil:
 				wins.Add(1)
@@ -75,10 +90,10 @@ func TestReserveRaceSingleSeat(t *testing.T) {
 // A request that includes one taken seat must hold none of them.
 func TestReserveAllOrNothing(t *testing.T) {
 	s, ctx := testStore(t), context.Background()
-	if _, err := s.Reserve(ctx, "a", []int{10}, time.Minute); err != nil {
+	if _, err := s.Reserve(ctx, testShow, "a", []int{10}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Reserve(ctx, "b", []int{9, 10, 11}, time.Minute); !errors.Is(err, ErrConflict) {
+	if _, err := s.Reserve(ctx, testShow, "b", []int{9, 10, 11}, time.Minute); !errors.Is(err, ErrConflict) {
 		t.Fatalf("want conflict, got %v", err)
 	}
 	st := assertInvariants(t, s)
@@ -99,7 +114,7 @@ func TestReserveOverlappingRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			ids := []int{1 + rand.N(20), 21 + rand.N(20), 41 + rand.N(20)} // distinct ranges => no duplicate ids
-			h, err := s.Reserve(ctx, fmt.Sprintf("fan-%d", i), ids, time.Minute)
+			h, err := s.Reserve(ctx, testShow, fmt.Sprintf("fan-%d", i), ids, time.Minute)
 			if errors.Is(err, ErrConflict) {
 				return
 			} else if err != nil {
@@ -128,8 +143,8 @@ func TestReserveOverlappingRace(t *testing.T) {
 // A fan picking again replaces their previous hold instead of hoarding seats.
 func TestReserveReplacesPreviousHold(t *testing.T) {
 	s, ctx := testStore(t), context.Background()
-	first, _ := s.Reserve(ctx, "a", []int{1}, time.Minute)
-	if _, err := s.Reserve(ctx, "a", []int{2}, time.Minute); err != nil {
+	first, _ := s.Reserve(ctx, testShow, "a", []int{1}, time.Minute)
+	if _, err := s.Reserve(ctx, testShow, "a", []int{2}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	h, _ := s.Hold(ctx, first.ID)
@@ -140,21 +155,21 @@ func TestReserveReplacesPreviousHold(t *testing.T) {
 
 func TestSweepReleasesExpiredHolds(t *testing.T) {
 	s, ctx := testStore(t), context.Background()
-	h, err := s.Reserve(ctx, "a", []int{1, 2, 3}, 10*time.Millisecond)
+	h, err := s.Reserve(ctx, testShow, "a", []int{1, 2, 3}, 10*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	n, err := s.SweepExpired(ctx)
-	if err != nil || n != 3 {
-		t.Fatalf("freed %d seats (err %v), want 3", n, err)
+	freed, err := s.SweepExpired(ctx)
+	if err != nil || freed[testShow] != 3 {
+		t.Fatalf("freed %v (err %v), want 3 for show %d", freed, err, testShow)
 	}
 	got, _ := s.Hold(ctx, h.ID)
 	if got.Status != "expired" {
 		t.Fatalf("status %s, want expired", got.Status)
 	}
 	// the freed seats can be booked again
-	if _, err := s.Reserve(ctx, "b", []int{1, 2, 3}, time.Minute); err != nil {
+	if _, err := s.Reserve(ctx, testShow, "b", []int{1, 2, 3}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -167,7 +182,7 @@ func paymentFor(h Hold, eventID string) PaymentEvent {
 // still produces exactly one order.
 func TestCompleteOrderIsIdempotent(t *testing.T) {
 	s, ctx := testStore(t), context.Background()
-	h, _ := s.Reserve(ctx, "a", []int{7, 8}, time.Minute)
+	h, _ := s.Reserve(ctx, testShow, "a", []int{7, 8}, time.Minute)
 
 	outcomes := make(chan Outcome, 5)
 	var wg sync.WaitGroup
@@ -203,10 +218,10 @@ func TestCompleteOrderIsIdempotent(t *testing.T) {
 // Payment landing after the hold expired: never sells the seats, queues a refund.
 func TestLatePaymentIsRefunded(t *testing.T) {
 	s, ctx := testStore(t), context.Background()
-	h, _ := s.Reserve(ctx, "a", []int{1}, 10*time.Millisecond)
+	h, _ := s.Reserve(ctx, testShow, "a", []int{1}, 10*time.Millisecond)
 	time.Sleep(50 * time.Millisecond)
 	s.SweepExpired(ctx)
-	other, err := s.Reserve(ctx, "b", []int{1}, time.Minute) // someone else takes the seat
+	other, err := s.Reserve(ctx, testShow, "b", []int{1}, time.Minute) // someone else takes the seat
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +247,7 @@ func TestLatePaymentIsRefunded(t *testing.T) {
 // The amount comes from our database; a mismatching payment is refunded, not fulfilled.
 func TestAmountMismatchIsRefunded(t *testing.T) {
 	s, ctx := testStore(t), context.Background()
-	h, _ := s.Reserve(ctx, "a", []int{1}, time.Minute)
+	h, _ := s.Reserve(ctx, testShow, "a", []int{1}, time.Minute)
 	ev := paymentFor(h, "evt_cheap")
 	ev.AmountCents = 1
 	if o, _, _ := s.CompleteOrder(ctx, ev); o != OutcomeRefund {
@@ -244,7 +259,7 @@ func TestAmountMismatchIsRefunded(t *testing.T) {
 // A second, different payment for an already-paid hold is flagged, not counted as a harmless duplicate.
 func TestSecondPaymentIsFlagged(t *testing.T) {
 	s, ctx := testStore(t), context.Background()
-	h, _ := s.Reserve(ctx, "a", []int{1}, time.Minute)
+	h, _ := s.Reserve(ctx, testShow, "a", []int{1}, time.Minute)
 	if o, _, _ := s.CompleteOrder(ctx, paymentFor(h, "evt_a")); o != OutcomePaid {
 		t.Fatalf("first payment: %s", o)
 	}
@@ -261,5 +276,97 @@ func TestUnknownHold(t *testing.T) {
 	o, _, err := s.CompleteOrder(ctx, PaymentEvent{EventID: "evt_x", HoldID: "00000000-0000-0000-0000-000000000000", AmountCents: 1})
 	if err != nil || o != OutcomeUnknown {
 		t.Fatalf("got %s %v, want unknown", o, err)
+	}
+}
+
+// The same seat number in two shows is two different seats: holding one never touches the other.
+func TestHoldsCannotCrossShows(t *testing.T) {
+	s, ctx := testStore(t), context.Background()
+	a := testShow
+	b, err := s.CreateShow(ctx, "TS", testPlan())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reserve(ctx, a, "fan", []int{5}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	hb, err := s.Reserve(ctx, b.ID, "fan", []int{5}, time.Minute)
+	if err != nil {
+		t.Fatalf("seat 5 of show b should be free: %v", err)
+	}
+	if hb.ShowID != b.ID || len(hb.Seats) != 1 {
+		t.Fatalf("hold %+v", hb)
+	}
+	// a fan's second hold in show b must not cancel their hold in show a
+	if st, _ := s.Stats(ctx, a); st.Held != 1 {
+		t.Fatalf("show a held=%d, want 1", st.Held)
+	}
+	// an id that only exists in a bigger show cannot be claimed in a smaller one
+	if _, err := s.Reserve(ctx, a, "fan2", []int{999}, time.Minute); !errors.Is(err, ErrConflict) {
+		t.Fatalf("seat 999 in a 200-seat show: %v", err)
+	}
+}
+
+// Many first visitors to a state at once still create exactly one lineup.
+func TestLineupCreatedOnce(t *testing.T) {
+	s, ctx := testStore(t), context.Background()
+	state, _ := catalog.StateByCode("VT")
+	s.pool.Exec(ctx, `DELETE FROM shows WHERE state = 'VT'`)
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.EnsureLineup(ctx, state, false); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	shows, err := s.Lineup(ctx, "VT")
+	if err != nil || len(shows) != ShowsPerState {
+		t.Fatalf("%d shows (err %v), want %d", len(shows), err, ShowsPerState)
+	}
+}
+
+// General admission: 60 fans race for 4 floor tickets each; the floor never oversells and every
+// winner gets exactly 4.
+func TestReserveGANeverOversells(t *testing.T) {
+	s, ctx := testStore(t), context.Background()
+	sh, err := s.CreateShow(ctx, "TS", catalog.Plan{Venue: catalog.Venue{Key: "test-club", Capacity: 4000, Kind: catalog.Ballroom},
+		Act: "The Floor Test", StartsAt: time.Now().Add(720 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seats, _ := s.Seats(ctx, sh.ID)
+	floor := 0
+	for _, x := range seats {
+		if x.Section == "Floor" {
+			floor++
+		}
+	}
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for i := range 60 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h, err := s.ReserveGA(ctx, sh.ID, fmt.Sprintf("fan-%d", i), "Floor", 4, time.Minute)
+			if errors.Is(err, ErrConflict) {
+				return
+			} else if err != nil {
+				t.Error(err)
+				return
+			}
+			if len(h.Seats) != 4 {
+				t.Errorf("hold got %d floor tickets, want 4", len(h.Seats))
+			}
+			wins.Add(1)
+		}()
+	}
+	wg.Wait()
+	st, _ := s.Stats(ctx, sh.ID)
+	if st.Held != int(wins.Load())*4 || st.Held > floor || int(wins.Load()) != floor/4 {
+		t.Fatalf("floor %d, held %d, winners %d", floor, st.Held, wins.Load())
 	}
 }

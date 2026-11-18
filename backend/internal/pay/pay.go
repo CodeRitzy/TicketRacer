@@ -100,29 +100,38 @@ func NewID(prefix string) string {
 
 // Provider creates checkout pages and refunds payments.
 type Provider interface {
-	Checkout(ctx context.Context, h store.Hold, publicURL string) (string, error)
+	Checkout(ctx context.Context, h store.Hold, title, publicURL string) (string, error)
 	Refund(ctx context.Context, paymentRef, orderID string) error
+	// Lookup reads a checkout session straight from the provider, so an order can be confirmed
+	// when the fan returns from checkout even if the webhook never arrives.
+	Lookup(ctx context.Context, sessionID string) (Event, error)
 }
 
 // Demo sends fans to the built-in demo payment page; refunds are no-ops.
 type Demo struct{}
 
-func (Demo) Checkout(_ context.Context, h store.Hold, publicURL string) (string, error) {
+func (Demo) Checkout(_ context.Context, h store.Hold, _, publicURL string) (string, error) {
 	return publicURL + "/pay/demo?hold=" + h.ID, nil
 }
 func (Demo) Refund(context.Context, string, string) error { return nil }
+
+// Lookup is not needed in demo mode: demo payments always deliver their webhook synchronously.
+func (Demo) Lookup(context.Context, string) (Event, error) {
+	return Event{}, errors.New("lookup not supported in demo mode")
+}
 
 // Stripe uses Checkout Sessions in test mode.
 type Stripe struct{ c *stripe.Client }
 
 func NewStripe(secretKey string) *Stripe { return &Stripe{c: stripe.NewClient(secretKey)} }
 
-func (s *Stripe) Checkout(ctx context.Context, h store.Hold, publicURL string) (string, error) {
+func (s *Stripe) Checkout(ctx context.Context, h store.Hold, title, publicURL string) (string, error) {
 	p := &stripe.CheckoutSessionCreateParams{
 		Mode:              stripe.String("payment"),
 		ClientReferenceID: stripe.String(h.ID),
-		SuccessURL:        stripe.String(publicURL + "/confirmation?hold=" + h.ID),
-		CancelURL:         stripe.String(publicURL + "/?cancelled=" + h.ID),
+		// Stripe fills in {CHECKOUT_SESSION_ID}; the confirmation page uses it to confirm without the webhook
+		SuccessURL: stripe.String(publicURL + "/confirmation?hold=" + h.ID + "&session={CHECKOUT_SESSION_ID}"),
+		CancelURL:  stripe.String(publicURL + "/?cancelled=" + h.ID),
 		// No custom expires_at: params must be identical for the idempotency key below to return the
 		// same session on a repeat click. A payment landing after our 10-minute hold is refunded.
 	}
@@ -132,7 +141,7 @@ func (s *Stripe) Checkout(ctx context.Context, h store.Hold, publicURL string) (
 			PriceData: &stripe.CheckoutSessionCreateLineItemPriceDataParams{
 				Currency:    stripe.String("usd"),
 				UnitAmount:  stripe.Int64(int64(seat.PriceCents)),
-				ProductData: &stripe.CheckoutSessionCreateLineItemPriceDataProductDataParams{Name: stripe.String(fmt.Sprintf("Row %s · Seat %d", seat.Row, seat.Number))},
+				ProductData: &stripe.CheckoutSessionCreateLineItemPriceDataProductDataParams{Name: stripe.String(fmt.Sprintf("%s — %s, Row %s, Seat %d", title, seat.Section, seat.Row, seat.Number))},
 			},
 		})
 	}
@@ -143,6 +152,24 @@ func (s *Stripe) Checkout(ctx context.Context, h store.Hold, publicURL string) (
 		return "", fmt.Errorf("stripe checkout: %w", err)
 	}
 	return sess.URL, nil
+}
+
+// Lookup retrieves a Checkout Session and maps it to the same Event shape a webhook produces.
+// The event id is derived from the session, so this path and the webhook dedupe on the hold.
+func (s *Stripe) Lookup(ctx context.Context, sessionID string) (Event, error) {
+	sess, err := s.c.V1CheckoutSessions.Retrieve(ctx, sessionID, nil)
+	if err != nil {
+		return Event{}, fmt.Errorf("stripe session lookup: %w", err)
+	}
+	ev := Event{ID: "sync_" + sess.ID, Type: "checkout.session.completed", HoldID: sess.ClientReferenceID,
+		SessionRef: sess.ID, AmountCents: int(sess.AmountTotal), Paid: sess.PaymentStatus == "paid"}
+	if sess.PaymentIntent != nil {
+		ev.PaymentRef = sess.PaymentIntent.ID
+	}
+	if sess.CustomerDetails != nil {
+		ev.Email = sess.CustomerDetails.Email
+	}
+	return ev, nil
 }
 
 func (s *Stripe) Refund(ctx context.Context, paymentRef, orderID string) error {

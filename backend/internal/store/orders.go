@@ -59,7 +59,8 @@ func (s *Store) CompleteOrder(ctx context.Context, ev PaymentEvent) (Outcome, st
 
 	// 2. lock the hold so expiry and payment cannot interleave
 	var status string
-	err = tx.QueryRow(ctx, `SELECT status FROM holds WHERE id=$1 FOR UPDATE`, ev.HoldID).Scan(&status)
+	var showID int
+	err = tx.QueryRow(ctx, `SELECT status, show_id FROM holds WHERE id=$1 FOR UPDATE`, ev.HoldID).Scan(&status, &showID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return OutcomeUnknown, "", tx.Commit(ctx) // keep the event id so retries stop
 	} else if err != nil {
@@ -79,9 +80,9 @@ func (s *Store) CompleteOrder(ctx context.Context, ev PaymentEvent) (Outcome, st
 	}
 	var orderID string
 	err = tx.QueryRow(ctx, `
-		INSERT INTO orders (hold_id, payment_ref, session_ref, email, amount_cents, status)
-		VALUES ($1, NULLIF($2,''), $3, $4, $5, $6) ON CONFLICT DO NOTHING RETURNING id`,
-		ev.HoldID, ev.PaymentRef, ev.SessionRef, ev.Email, ev.AmountCents, orderStatus).Scan(&orderID)
+		INSERT INTO orders (show_id, hold_id, payment_ref, session_ref, email, amount_cents, status)
+		VALUES ($7, $1, NULLIF($2,''), $3, $4, $5, $6) ON CONFLICT DO NOTHING RETURNING id`,
+		ev.HoldID, ev.PaymentRef, ev.SessionRef, ev.Email, ev.AmountCents, orderStatus, showID).Scan(&orderID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// same hold or payment already has an order. If it was a *different* payment, the fan paid twice:
 		// flag it so it is refunded by hand rather than silently kept.
@@ -154,35 +155,43 @@ type Stats struct {
 	Reconciled           bool `json:"reconciled"`              // paid revenue == price of sold seats
 }
 
-func (s *Store) Stats(ctx context.Context) (st Stats, err error) {
+// Stats reads one show's numbers and invariants; showID 0 means every show.
+// webhook_events has no show, so that count is always global.
+func (s *Store) Stats(ctx context.Context, showID int) (st Stats, err error) {
 	err = s.pool.QueryRow(ctx, `
 	SELECT
 	  count(*) FILTER (WHERE status='available'), count(*) FILTER (WHERE status='held'), count(*) FILTER (WHERE status='sold'),
-	  (SELECT count(*) FROM orders WHERE status='paid'),
-	  (SELECT count(*) FROM orders WHERE status IN ('refunded','refund_pending')),
-	  (SELECT coalesce(sum(amount_cents),0) FROM orders WHERE status='paid'),
+	  (SELECT count(*) FROM orders WHERE status='paid' AND ($1 = 0 OR show_id = $1)),
+	  (SELECT count(*) FROM orders WHERE status IN ('refunded','refund_pending') AND ($1 = 0 OR show_id = $1)),
+	  (SELECT coalesce(sum(amount_cents),0) FROM orders WHERE status='paid' AND ($1 = 0 OR show_id = $1)),
 	  (SELECT count(*) FROM webhook_events),
-	  (SELECT count(*) FROM seats x WHERE x.status='sold' AND NOT EXISTS
+	  (SELECT count(*) FROM seats x WHERE x.status='sold' AND ($1 = 0 OR x.show_id = $1) AND NOT EXISTS
 	      (SELECT 1 FROM orders o WHERE o.hold_id=x.hold_id AND o.status='paid')),
-	  (SELECT count(*) FROM (SELECT hold_id FROM orders GROUP BY hold_id HAVING count(*) > 1) d),
-	  coalesce(sum(price_cents) FILTER (WHERE status='sold'),0) = (SELECT coalesce(sum(amount_cents),0) FROM orders WHERE status='paid')
-	FROM seats`).Scan(&st.Available, &st.Held, &st.Sold, &st.OrdersPaid, &st.OrdersRefunded, &st.RevenueCents,
-		&st.WebhookEvents, &st.SoldWithoutPaidOrder, &st.DuplicateOrders, &st.Reconciled)
+	  (SELECT count(*) FROM (SELECT hold_id FROM orders WHERE ($1 = 0 OR show_id = $1) GROUP BY hold_id HAVING count(*) > 1) d),
+	  coalesce(sum(price_cents) FILTER (WHERE status='sold'),0) =
+	    (SELECT coalesce(sum(amount_cents),0) FROM orders WHERE status='paid' AND ($1 = 0 OR show_id = $1))
+	FROM seats WHERE ($1 = 0 OR show_id = $1)`, showID).Scan(&st.Available, &st.Held, &st.Sold, &st.OrdersPaid, &st.OrdersRefunded,
+		&st.RevenueCents, &st.WebhookEvents, &st.SoldWithoutPaidOrder, &st.DuplicateOrders, &st.Reconciled)
 	return
 }
 
-// Reset returns the event to its initial state (used by the dashboard between simulations).
-func (s *Store) Reset(ctx context.Context) error {
+// Reset clears a show's bookings (showID 0: every show, plus the webhook log). The shows stay.
+func (s *Store) Reset(ctx context.Context, showID int) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	for _, q := range []string{
-		`UPDATE seats SET status='available', hold_id=NULL`,
-		`DELETE FROM orders`, `DELETE FROM webhook_events`, `DELETE FROM holds`,
-	} {
-		if _, err = tx.Exec(ctx, q); err != nil {
+	queries := []string{
+		`UPDATE seats SET status='available', hold_id=NULL WHERE ($1 = 0 OR show_id = $1) AND status <> 'available'`,
+		`DELETE FROM orders WHERE ($1 = 0 OR show_id = $1)`,
+		`DELETE FROM holds WHERE ($1 = 0 OR show_id = $1)`,
+	}
+	if showID == 0 {
+		queries = append(queries, `DELETE FROM webhook_events WHERE $1 = 0`)
+	}
+	for _, q := range queries {
+		if _, err = tx.Exec(ctx, q, showID); err != nil {
 			return err
 		}
 	}
