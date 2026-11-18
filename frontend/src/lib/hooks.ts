@@ -1,5 +1,6 @@
 // Small React hooks: routing, live seats over SSE, a ticking clock and polling.
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { flushSync } from 'react-dom'
 import { api } from '../api'
 import { applyFrame, type Seat } from './seats'
 
@@ -15,10 +16,18 @@ export function useRoute(): URL {
   return new URL(href)
 }
 
+// navigate changes the URL and re-renders. Forward navigations play the page-transition curtain
+// through the View Transitions API (flushSync makes React commit inside the transition);
+// redirects (replace) and reduced-motion users get an instant swap.
 export function navigate(to: string, replace = false) {
-  if (replace) history.replaceState(null, '', to)
-  else history.pushState(null, '', to)
-  window.dispatchEvent(new PopStateEvent('popstate'))
+  const go = () => {
+    if (replace) history.replaceState(null, '', to)
+    else history.pushState(null, '', to)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }
+  const doc = document as Document & { startViewTransition?: (cb: () => void) => unknown }
+  if (!replace && doc.startViewTransition && !prefersReducedMotion()) doc.startViewTransition(() => flushSync(go))
+  else go()
 }
 
 // --- live status: the rail lamp reads whether any page's seat stream is connected ------------
@@ -36,7 +45,8 @@ export function useLiveStatus(): boolean {
 
 // --- live seats: one SSE stream; falls back to polling if the stream drops ---------------
 
-export function useLiveSeats(): { seats: Seat[]; live: boolean; error: string } {
+// useLiveSeats streams one show's seat statuses; showId 0 means none (returns no seats).
+export function useLiveSeats(showId: number): { seats: Seat[]; live: boolean; error: string } {
   const [seats, setSeats] = useState<Seat[]>([])
   const [live, setLiveLocal] = useState(false)
   const setLive = useCallback((v: boolean) => { setLiveLocal(v); setLiveGlobal(v) }, [])
@@ -52,12 +62,13 @@ export function useLiveSeats(): { seats: Seat[]; live: boolean; error: string } 
       seatsRef.current = next
       setSeats(next)
     }
+    if (!showId) { setSeats([]); return }
     const refetch = () =>
-      api.seats().then((s) => !cancelled && update(s), () => !cancelled && setError('Seat map unavailable, retrying…'))
+      api.seats(showId).then((s) => !cancelled && update(s), () => !cancelled && setError('Seat map unavailable, retrying…'))
 
     refetch().then(() => {
       if (cancelled) return
-      es = new EventSource('/api/seats/stream')
+      es = new EventSource(`/api/shows/${showId}/seats/stream`)
       es.onopen = () => { setLive(true); setError(''); window.clearInterval(poll) }
       es.onmessage = (e) => {
         const frame = (JSON.parse(e.data) as { s: string }).s
@@ -72,7 +83,7 @@ export function useLiveSeats(): { seats: Seat[]; live: boolean; error: string } 
       }
     })
     return () => { cancelled = true; es?.close(); window.clearInterval(poll); setLiveGlobal(false) }
-  }, [setLive])
+  }, [setLive, showId])
 
   return { seats, live, error }
 }

@@ -4,7 +4,7 @@
 import { useEffect, useRef } from 'react'
 import type { AdminStats } from '../api'
 import { prefersReducedMotion } from '../lib/hooks'
-import { Flap } from './Flap'
+import { Ticker } from './Ticker'
 
 type Pt = [number, number]
 interface Node { id: string; x: number; y: number; label: string; tone?: string }
@@ -16,17 +16,17 @@ const TOP = 130
 const LOW = 330
 
 const NODES: Node[] = [
-  { id: 'arrive', x: 80, y: TOP, label: 'Fans joined' },
-  { id: 'queue', x: 265, y: TOP, label: 'In line now' },
-  { id: 'admit', x: 450, y: TOP, label: 'Admitted' },
-  { id: 'reserve', x: 635, y: TOP, label: 'Reserve attempts' },
-  { id: 'hold', x: 820, y: TOP, label: 'Seats held now' },
-  { id: 'webhook', x: 1005, y: TOP, label: 'Webhooks in' },
-  { id: 'order', x: 1190, y: TOP, label: 'Paid orders', tone: 'green' },
-  { id: 'conflict', x: 635, y: LOW, label: '409 conflicts', tone: 'red' },
-  { id: 'expired', x: 820, y: LOW, label: 'Seats released', tone: 'amber' },
-  { id: 'duplicate', x: 1005, y: LOW, label: 'Duplicates blocked', tone: 'green' },
-  { id: 'refund', x: 1190, y: LOW, label: 'Refunded', tone: 'amber' },
+  { id: 'arrive', x: 112, y: TOP, label: 'Fans joined' },
+  { id: 'queue', x: 288, y: TOP, label: 'In line now' },
+  { id: 'admit', x: 464, y: TOP, label: 'Admitted' },
+  { id: 'reserve', x: 640, y: TOP, label: 'Reserve attempts' },
+  { id: 'hold', x: 816, y: TOP, label: 'Seats held now' },
+  { id: 'webhook', x: 992, y: TOP, label: 'Webhooks in' },
+  { id: 'order', x: 1168, y: TOP, label: 'Paid orders', tone: 'green' },
+  { id: 'conflict', x: 640, y: LOW, label: '409 conflicts', tone: 'red' },
+  { id: 'expired', x: 816, y: LOW, label: 'Seats released', tone: 'amber' },
+  { id: 'duplicate', x: 992, y: LOW, label: 'Duplicates blocked', tone: 'green' },
+  { id: 'refund', x: 1168, y: LOW, label: 'Refunded', tone: 'amber' },
 ]
 // node boxes are 156 x 76; edges run border to border so dots never cross the numbers
 const HW = 78
@@ -35,9 +35,10 @@ const node = (id: string) => NODES.find((x) => x.id === id)!
 const right = (id: string): Pt => [node(id).x + HW, node(id).y]
 const left = (id: string): Pt => [node(id).x - HW, node(id).y]
 const bottom = (id: string): Pt => [node(id).x, node(id).y + HH]
-const top = (id: string): Pt => [node(id).x, node(id).y - HH - 22] // clear the label above the box
+const top = (id: string): Pt => [node(id).x, node(id).y - HH - 34] // stop above the label over the box
 
-const C = { main: '#f1ede3', red: '#ef5a48', amber: '#e3a33d', green: '#66d19a' }
+// colours are the shared styles.css tokens, so the pipeline always matches the rest of the app
+const C = { main: 'var(--ink)', red: 'var(--red)', amber: 'var(--amber)', green: 'var(--green)' }
 const EDGES: Edge[] = [
   { id: 'arrive>queue', path: [right('arrive'), left('queue')], color: C.main },
   { id: 'queue>admit', path: [right('queue'), left('admit')], color: C.main },
@@ -48,7 +49,7 @@ const EDGES: Edge[] = [
   { id: 'hold>expired', path: [bottom('hold'), top('expired')], color: C.amber },
   { id: 'webhook>order', path: [right('webhook'), left('order')], color: C.green },
   { id: 'webhook>duplicate', path: [bottom('webhook'), top('duplicate')], color: C.green },
-  { id: 'webhook>refund', path: [[1098, TOP], [1098, LOW], left('refund')], color: C.amber },
+  { id: 'webhook>refund', path: [[1080, TOP], [1080, LOW], left('refund')], color: C.amber },
 ]
 
 const LEGEND: [string, string][] = [
@@ -131,6 +132,10 @@ export function Pipeline({ stats }: { stats: AdminStats | null }) {
     const el = canvas.current
     if (!el) return
     const ctx = el.getContext('2d')!
+    // a canvas can't read CSS variables: resolve each token ('var(--red)') to its value once
+    const style = getComputedStyle(el)
+    const resolved: Record<string, string> = {}
+    const paint = (c: string) => (resolved[c] ??= style.getPropertyValue(c.slice(4, -1)).trim())
     let raf = 0
     const draw = (now: number) => {
       const { width, height } = el.getBoundingClientRect()
@@ -145,7 +150,7 @@ export function Pipeline({ stats }: { stats: AdminStats | null }) {
         const eased = 1 - Math.pow(1 - t, 2)
         const [x, y] = pointOn(d.edge.path, eased)
         ctx.globalAlpha = t > 0.85 ? (1 - t) / 0.15 : 1
-        ctx.fillStyle = d.edge.color
+        ctx.fillStyle = paint(d.edge.color)
         ctx.beginPath()
         ctx.arc(x, y, 3.2, 0, Math.PI * 2)
         ctx.fill()
@@ -159,7 +164,6 @@ export function Pipeline({ stats }: { stats: AdminStats | null }) {
 
   const v = stats ? values(stats) : null
   const now = performance.now()
-  const toneColor = toneOf
 
   return (
     <>
@@ -173,26 +177,25 @@ export function Pipeline({ stats }: { stats: AdminStats | null }) {
               : 'Loading.'}
           </desc>
           {EDGES.map((e) => (
+            // token colours go through style: CSS variables aren't reliable in SVG presentation attributes
             <polyline key={e.id} points={e.path.map((p) => p.join(',')).join(' ')} fill="none"
-              stroke={(hot.current[e.id] ?? 0) > now ? e.color : '#3a3d43'} strokeOpacity={(hot.current[e.id] ?? 0) > now ? 0.55 : 1}
-              strokeWidth={2} style={{ transition: 'stroke 400ms' }} />
+              strokeOpacity={(hot.current[e.id] ?? 0) > now ? 0.55 : 1} strokeWidth={2}
+              style={{ stroke: (hot.current[e.id] ?? 0) > now ? e.color : 'var(--hair-strong)', transition: 'stroke 400ms' }} />
           ))}
           <g transform={`translate(60 ${LOW - 52})`} aria-hidden="true">
             {LEGEND.map(([color, text], i) => (
               <g key={text} transform={`translate(0 ${i * 30})`}>
-                <circle cx={6} cy={-5} r={5} fill={color} />
-                <text x={22} y={0} fill="#aba69c" style={{ font: '400 16px Barlow, sans-serif' }}>{text}</text>
+                <circle cx={6} cy={-5} r={5} style={{ fill: color }} />
+                <text x={22} y={0} style={{ fill: 'var(--ink-3)', font: '400 15px "Geist Variable", sans-serif' }}>{text}</text>
               </g>
             ))}
           </g>
           {NODES.map((n) => (
             <g key={n.id} transform={`translate(${n.x - 78} ${n.y - 38})`}>
-              <text x={78} y={-12} textAnchor="middle" fill="#aba69c" style={{ font: '600 13px Barlow, sans-serif', letterSpacing: '0.14em', textTransform: 'uppercase' }}>{n.label}</text>
-              <rect width={156} height={76} rx={4} fill="#1f2125" stroke="#3a3d43" />
-              <rect width={156} height={38} rx={4} fill="#282b30" />
-              <line x1={0} x2={156} y1={38} y2={38} stroke="#070809" />
-              <text x={78} y={52} textAnchor="middle" fill={toneColor(n.tone)}
-                style={{ font: '700 38px "Big Shoulders Display Variable", sans-serif', fontVariantNumeric: 'tabular-nums' }}>
+              <text x={78} y={-12} textAnchor="middle" style={{ fill: 'var(--ink-3)', font: '500 11px "Geist Mono Variable", monospace', letterSpacing: '0.08em', textTransform: 'uppercase' }}>{n.label}</text>
+              <rect width={156} height={76} rx={18} style={{ fill: 'var(--surface)', stroke: 'var(--hair-strong)' }} />
+              <text x={78} y={52} textAnchor="middle"
+                style={{ fill: toneOf(n.tone), font: '300 36px "Geist Variable", sans-serif', fontVariantNumeric: 'tabular-nums' }}>
                 {v ? v[n.id].toLocaleString('en-US') : '—'}
               </text>
             </g>
@@ -224,7 +227,7 @@ function Stack({ v }: { v: Record<string, number> | null }) {
       {STAGES.map(([id, label, branch, branchLabel]) => (
         <li key={id}>
           <span>{label}</span>
-          <Flap value={v ? v[id].toLocaleString('en-US') : '-'} width={6} align="right" label={`${label}: ${v?.[id] ?? 0}`} />
+          <Ticker value={v ? v[id].toLocaleString('en-US') : '-'} width={6} align="right" label={`${label}: ${v?.[id] ?? 0}`} />
           {branch && (
             <small>
               <span>{branchLabel}</span>

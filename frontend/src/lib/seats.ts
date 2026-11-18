@@ -4,6 +4,7 @@ export type SeatStatus = 'available' | 'held' | 'sold'
 
 export interface Seat {
   id: number
+  section: string
   row: string
   number: number
   price_cents: number
@@ -34,7 +35,7 @@ export function applyFrame(seats: Seat[], frame: string): Seat[] {
   return changed ? next : seats
 }
 
-// groupRows keeps API order (by id), which is row-major.
+// groupRows keeps API order (by id), which is row-major; pass one section's seats.
 export function groupRows(seats: Seat[]): [string, Seat[]][] {
   const rows = new Map<string, Seat[]>()
   for (const s of seats) rows.set(s.row, [...(rows.get(s.row) ?? []), s])

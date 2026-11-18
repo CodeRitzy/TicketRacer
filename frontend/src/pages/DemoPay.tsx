@@ -1,16 +1,21 @@
 // Built-in test checkout (demo payment mode). Paying sends a Stripe-format, HMAC-signed webhook
 // to the same endpoint Stripe uses, so the order path is the production one.
 import { useEffect, useState } from 'react'
-import { api, type Hold } from '../api'
+import { api, type Hold, type ShowDetail } from '../api'
+import { TicketList } from '../components/TicketList'
 import { navigate } from '../lib/hooks'
 import { formatPrice } from '../lib/seats'
 
 export function DemoPay({ holdId }: { holdId: string }) {
   const [hold, setHold] = useState<Hold | null>(null)
+  const [show, setShow] = useState<ShowDetail | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
-  useEffect(() => { api.getHold(holdId).then(setHold, () => setError('This hold does not exist for this browser tab.')) }, [holdId])
+  useEffect(() => {
+    api.getHold(holdId).then((h) => { setHold(h); api.show(h.show_id).then(setShow, () => undefined) },
+      () => setError('This hold does not exist for this browser tab.'))
+  }, [holdId])
 
   const pay = async () => {
     setBusy(true)
@@ -31,13 +36,11 @@ export function DemoPay({ holdId }: { holdId: string }) {
       {error && <p className="notice" data-tone="error" role="alert"><strong>Error</strong> {error}</p>}
       {hold && (
         <>
-          <ul className="ticket-list">
-            {hold.seats.map((s) => <li key={s.id}><b>Row {s.row} · Seat {s.number}</b><span>{formatPrice(s.price_cents)}</span></li>)}
-          </ul>
+          <TicketList seats={hold.seats} gaSections={new Set((show?.sections ?? []).filter((s) => s.ga).map((s) => s.name))} />
           <div className="total"><span className="dim">Total</span><b>{formatPrice(hold.total_cents)}</b></div>
           <div className="hero__action">
-            <button className="btn" onClick={pay} disabled={busy || hold.status !== 'active'}>{busy ? 'Paying…' : `Pay ${formatPrice(hold.total_cents)}`}</button>
-            <button className="btn btn--ghost btn--small" onClick={() => navigate(`/hold/${holdId}`)}>Back</button>
+            <button className="pill pill--ink" onClick={pay} disabled={busy || hold.status !== 'active'}>{busy ? 'Paying…' : `Pay ${formatPrice(hold.total_cents)}`}</button>
+            <button className="pill pill--glass pill--small" onClick={() => navigate(`/hold/${holdId}`)}>Back</button>
           </div>
         </>
       )}

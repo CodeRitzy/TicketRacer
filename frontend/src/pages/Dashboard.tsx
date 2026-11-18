@@ -1,16 +1,18 @@
 // Operator dashboard: invariants read from Postgres, the live pipeline, and the traffic simulator.
-import { useState, type FormEvent } from 'react'
-import { api, ApiError, session, type AdminStats, type SimConfig } from '../api'
-import { Flap } from '../components/Flap'
+import { useEffect, useState, type FormEvent } from 'react'
+import { api, ApiError, session, type AdminStats, type ShowDetail, type SimConfig } from '../api'
+import { Ticker } from '../components/Ticker'
 import { Pipeline } from '../components/Pipeline'
-import { useLiveSeats, usePoll } from '../lib/hooks'
+import { navigate, useLiveSeats, usePoll } from '../lib/hooks'
+import { sectionBreakdown } from '../lib/picker'
 import { formatCount, formatPrice } from '../lib/seats'
 
-const DEFAULTS: SimConfig = { users: 2000, concurrency: 200, stampede: true, abandon_pct: 0.2, duplicate_pct: 0.3, max_seats: 4, abandon_ttl: 15 }
+const DEFAULTS: Omit<SimConfig, 'show_id'> = { users: 2000, concurrency: 200, stampede: true, abandon_pct: 0.2, duplicate_pct: 0.3, max_seats: 4, abandon_ttl: 15 }
 
-export function Dashboard() {
+// showId comes from the URL (/dashboard?show=N), set by a show's "Watch it under load" link; 0 = every show.
+export function Dashboard({ showId }: { showId: number }) {
   const [authed, setAuthed] = useState(!!session.admin())
-  return authed ? <Ops onSignOut={() => { session.setAdmin(''); setAuthed(false) }} /> : <Gate onOk={() => setAuthed(true)} />
+  return authed ? <Ops showId={showId} onSignOut={() => { session.setAdmin(''); setAuthed(false) }} /> : <Gate onOk={() => setAuthed(true)} />
 }
 
 // The admin token lives in this tab's sessionStorage only and is checked by the server.
@@ -21,7 +23,7 @@ function Gate({ onOk }: { onOk: () => void }) {
     e.preventDefault()
     session.setAdmin(token.trim())
     try {
-      await api.stats()
+      await api.stats(0)
       onOk()
     } catch (err) {
       session.setAdmin('')
@@ -37,23 +39,25 @@ function Gate({ onOk }: { onOk: () => void }) {
           <label htmlFor="admin-token">Admin token</label>
           <input id="admin-token" type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} required />
         </div>
-        <button className="btn" type="submit">Open the dashboard</button>
+        <button className="pill pill--ink" type="submit">Open the dashboard</button>
         {error && <p className="notice" data-tone="error" role="alert"><strong>Denied</strong> {error}</p>}
       </form>
     </main>
   )
 }
 
-function Ops({ onSignOut }: { onSignOut: () => void }) {
+function Ops({ showId, onSignOut }: { showId: number; onSignOut: () => void }) {
   const [stats, setStats] = useState<AdminStats | null>(null)
   const [offline, setOffline] = useState(false)
   const [notice, setNotice] = useState('')
-  const { seats } = useLiveSeats()
+  const [show, setShow] = useState<ShowDetail | null>(null)
+  const { seats } = useLiveSeats(showId)
+  useEffect(() => { if (showId) api.show(showId).then(setShow, () => setShow(null)); else setShow(null) }, [showId])
 
   // the one-second tick that drives every number and dot on this page
   usePoll(async () => {
     try {
-      setStats(await api.stats())
+      setStats(await api.stats(showId))
       setOffline(false)
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) { onSignOut(); return true }
@@ -62,8 +66,17 @@ function Ops({ onSignOut }: { onSignOut: () => void }) {
   }, 1000)
 
   const reset = async () => {
-    try { await api.reset(); setNotice('Bookings, queue and counters were reset.') }
+    try { await api.reset(showId); setNotice(show ? `Bookings for ${show.act} were reset.` : 'Bookings, queues and counters for every show were reset.') }
     catch (e) { setNotice(e instanceof ApiError ? e.message : 'Reset failed.') }
+  }
+  // a fresh lineup for the chosen show's state (six new acts and dates)
+  const regenerate = async () => {
+    if (!show) return
+    try {
+      // this show is replaced too, so go to the new lineup
+      await api.regenerate(show.venue.state)
+      navigate('/')
+    } catch (e) { setNotice(e instanceof ApiError ? e.message : 'Could not regenerate.') }
   }
 
   const db = stats?.db
@@ -75,13 +88,20 @@ function Ops({ onSignOut }: { onSignOut: () => void }) {
       <div className="ops__head">
         <div style={{ display: 'grid', gap: 12 }}>
           <h1 className="section__title">Operations</h1>
+          {show ? (
+            <p className="venue-line"><b>{show.act}</b> · {show.venue.name}, {show.venue.city}{' '}
+              · <a href={`/shows/${show.id}`} onClick={(e) => { e.preventDefault(); navigate(`/shows/${show.id}`) }}>Back to the show</a></p>
+          ) : (
+            <p className="venue-line">All shows. To run a simulation, open a show and choose <b>Watch it under load</b>.</p>
+          )}
           <p className="dim">Every number below is read from PostgreSQL and Redis once a second.
             Payment mode: <span className="mono">{stats?.payment_mode ?? '…'}</span>.</p>
         </div>
         <div className="hero__action">
           {offline && <span className="lamp" role="alert">API offline</span>}
-          <button className="btn btn--ghost btn--small" onClick={reset} disabled={running}>Reset event</button>
-          <button className="btn btn--ghost btn--small" onClick={onSignOut}>Sign out</button>
+          <button className="pill pill--glass pill--small" onClick={reset} disabled={running}>{showId ? 'Reset show' : 'Reset all'}</button>
+          {show && <button className="pill pill--glass pill--small" onClick={regenerate} disabled={running}>New {show.venue.state} lineup</button>}
+          <button className="pill pill--glass pill--small" onClick={onSignOut}>Sign out</button>
         </div>
       </div>
       {notice && <p className="notice" data-tone="ok" role="status"><strong>Done</strong> {notice}</p>}
@@ -92,11 +112,11 @@ function Ops({ onSignOut }: { onSignOut: () => void }) {
         </h2>
         <div className="checks">
           <div><span className="line__label">Oversold seats</span>
-            <Flap value={db?.sold_without_paid_order ?? 0} width={3} align="right" tone={db?.sold_without_paid_order ? 'red' : 'green'} /></div>
+            <Ticker value={db?.sold_without_paid_order ?? 0} width={3} align="right" tone={db?.sold_without_paid_order ? 'red' : 'green'} /></div>
           <div><span className="line__label">Duplicate orders</span>
-            <Flap value={db?.duplicate_orders ?? 0} width={3} align="right" tone={db?.duplicate_orders ? 'red' : 'green'} /></div>
+            <Ticker value={db?.duplicate_orders ?? 0} width={3} align="right" tone={db?.duplicate_orders ? 'red' : 'green'} /></div>
           <div><span className="line__label">Revenue reconciled</span>
-            <Flap value={db ? (db.reconciled ? 'Yes' : 'No') : '---'} width={3} tone={db && !db.reconciled ? 'red' : 'green'} /></div>
+            <Ticker value={db ? (db.reconciled ? 'Yes' : 'No') : '---'} width={3} tone={db && !db.reconciled ? 'red' : 'green'} /></div>
         </div>
         <p className="dim" style={{ fontSize: '0.95rem' }}>Oversold: sold seats with no paid order. Duplicate: holds with more than one order.
           Reconciled: paid revenue equals the price of every sold seat.</p>
@@ -111,17 +131,32 @@ function Ops({ onSignOut }: { onSignOut: () => void }) {
       </section>
 
       <div className="grid-2">
-        <Simulator running={running} progress={stats?.sim.progress} />
+        <Simulator running={running} progress={stats?.sim.progress} showId={showId} />
         <section aria-labelledby="seats-title" style={{ display: 'grid', gap: 20, alignContent: 'start' }}>
           <h2 id="seats-title" className="section__title" style={{ fontSize: 'clamp(1.6rem, 3vw, 2.4rem)' }}>The house</h2>
           <dl className="line" style={{ ['--cols' as string]: 3 }}>
-            <div><dt>Available</dt><dd><Flap value={db?.available ?? 0} width={3} align="right" /></dd></div>
-            <div><dt>Held</dt><dd><Flap value={db?.held ?? 0} width={3} align="right" tone="amber" /></dd></div>
-            <div><dt>Sold</dt><dd><Flap value={db?.sold ?? 0} width={3} align="right" /></dd></div>
+            <div><dt>Available</dt><dd><Ticker value={db?.available ?? 0} width={3} align="right" /></dd></div>
+            <div><dt>Held</dt><dd><Ticker value={db?.held ?? 0} width={3} align="right" tone="amber" /></dd></div>
+            <div><dt>Sold</dt><dd><Ticker value={db?.sold ?? 0} width={3} align="right" /></dd></div>
           </dl>
-          <div className="heat" role="img" aria-label={`Seat map: ${db?.available ?? 0} available, ${db?.held ?? 0} held, ${db?.sold ?? 0} sold`}>
-            {seats.map((s) => <i key={s.id} data-s={s.status[0]} />)}
-          </div>
+          {showId > 0 && seats.length > 0 && (
+            // the house by section: sold / held / available, no per-seat drawing
+            <ul className="house">
+              {sectionBreakdown(seats).map((b) => (
+                <li key={b.name}>
+                  <div className="house__head">
+                    <b>{b.name}</b>
+                    <span>{formatCount(b.sold)} sold · <em>{formatCount(b.held)} held</em> · {formatCount(b.available)} left of {formatCount(b.total)}</span>
+                  </div>
+                  <div className="house__bar" role="img" aria-label={`${b.name}: ${b.sold} sold, ${b.held} held, ${b.available} available of ${b.total}`}>
+                    <i data-k="sold" style={{ flexGrow: b.sold }} />
+                    <i data-k="held" style={{ flexGrow: b.held }} />
+                    <i data-k="left" style={{ flexGrow: b.available }} />
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
           <dl className="kv">
             <dt>Revenue</dt><dd>{formatPrice(db?.revenue_cents ?? 0)}</dd>
             <dt>Paid orders</dt><dd>{formatCount(db?.orders_paid ?? 0)}</dd>
@@ -136,15 +171,15 @@ function Ops({ onSignOut }: { onSignOut: () => void }) {
   )
 }
 
-function Simulator({ running, progress }: { running: boolean; progress?: Record<string, number> }) {
-  const [cfg, setCfg] = useState<SimConfig>(DEFAULTS)
+function Simulator({ running, progress, showId }: { running: boolean; progress?: Record<string, number>; showId: number }) {
+  const [cfg, setCfg] = useState<Omit<SimConfig, 'show_id'>>(DEFAULTS)
   const [error, setError] = useState('')
-  const set = <K extends keyof SimConfig>(k: K, v: SimConfig[K]) => setCfg((c) => ({ ...c, [k]: v }))
+  const set = <K extends keyof typeof cfg>(k: K, v: (typeof cfg)[K]) => setCfg((c) => ({ ...c, [k]: v }))
 
   const start = async (e: FormEvent) => {
     e.preventDefault()
     setError('')
-    try { await api.simulate(cfg) } catch (err) { setError(err instanceof ApiError ? err.message : 'Could not start.') }
+    try { await api.simulate({ ...cfg, show_id: showId }) } catch (err) { setError(err instanceof ApiError ? err.message : 'Could not start.') }
   }
 
   return (
@@ -168,7 +203,7 @@ function Simulator({ running, progress }: { running: boolean; progress?: Record<
         </div>
         <label className="check"><input type="checkbox" checked={cfg.stampede} onChange={(e) => set('stampede', e.target.checked)} />
           Stampede: skip the waiting room so everyone reserves at once</label>
-        <button className="btn" type="submit" disabled={running}>{running ? 'Simulation running…' : `Release ${cfg.users.toLocaleString('en-US')} fans`}</button>
+        <button className="pill pill--ink" type="submit" disabled={running || !showId}>{running ? 'Simulation running…' : !showId ? 'Open a show to simulate it' : `Release ${cfg.users.toLocaleString('en-US')} fans`}</button>
         {error && <p className="notice" data-tone="error" role="alert"><strong>Error</strong> {error}</p>}
       </form>
       {running && progress && (

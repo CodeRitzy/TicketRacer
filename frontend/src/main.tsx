@@ -1,8 +1,9 @@
 // Entry: self-hosted fonts (no third-party requests), global styles, then the app.
-import '@fontsource-variable/big-shoulders-display'
-import '@fontsource/barlow/400.css'
-import '@fontsource/barlow/600.css'
-import '@fontsource-variable/jetbrains-mono'
+import '@fontsource-variable/geist'
+
+import '@fontsource-variable/geist-mono'
+// italic serif for single accent words in the big headings
+import '@fontsource/bodoni-moda/latin-400-italic.css'
 import './styles.css'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { applyFrame, formatCountdown, formatPrice, groupRows, toggleSeat, type Seat } from './seats'
 
 const seat = (id: number, row: string, number: number, status: Seat['status'] = 'available'): Seat => ({
-  id, row, number, price_cents: 5000, status,
+  id, section: 'Floor', row, number, price_cents: 5000, status,
 })
 
 describe('toggleSeat', () => {
