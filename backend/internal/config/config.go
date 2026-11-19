@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -88,11 +89,35 @@ func Load() (Config, error) {
 	case c.PaymentMode != "demo" && c.PaymentMode != "stripe":
 		return c, fmt.Errorf("PAYMENT_MODE must be demo or stripe, got %q", c.PaymentMode)
 	}
-	// a placeholder or short secret would let anyone forge payments or act as admin; refuse to start
+	// a placeholder or short secret would let anyone forge payments or act as admin; refuse to start.
+	// The published local default is fine on your own machine and refused anywhere else.
+	local := isLocal(c.PublicURL)
 	for name, v := range map[string]string{"ADMIN_TOKEN": c.AdminToken, "DEMO_WEBHOOK_SECRET": c.DemoWebhookSecret} {
-		if v != "" && (len(v) < 24 || strings.Contains(v, "change-me")) {
+		switch {
+		case v == "" || (v == LocalDefault && local):
+			continue
+		case v == LocalDefault:
+			return c, fmt.Errorf("%s is the public local default but PUBLIC_URL is %s; set a random value before deploying", name, c.PublicURL)
+		case len(v) < 24 || strings.Contains(v, "change-me"):
 			return c, fmt.Errorf("%s is a placeholder or shorter than 24 characters; set a random value", name)
 		}
 	}
 	return c, nil
+}
+
+// LocalDefault is the password the repo ships so the project runs with zero setup on your own
+// machine. It is public, so Load refuses it unless the site is served from localhost.
+const LocalDefault = "localpassword1234567890"
+
+// isLocal reports whether the browser-facing URL points at this machine.
+func isLocal(publicURL string) bool {
+	u, err := url.Parse(publicURL)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }

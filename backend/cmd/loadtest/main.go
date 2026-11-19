@@ -4,6 +4,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
@@ -20,7 +21,8 @@ import (
 
 func main() {
 	config.LoadDotEnv("../.env")
-	cfg := sim.Config{AdminToken: os.Getenv("ADMIN_TOKEN")}
+	// with no .env the stack runs on the local default token, so use that too
+	cfg := sim.Config{AdminToken: cmp.Or(os.Getenv("ADMIN_TOKEN"), config.LocalDefault)}
 	flag.StringVar(&cfg.BaseURL, "url", "http://localhost:8080", "API base URL (nginx or the api directly)")
 	flag.IntVar(&cfg.Users, "users", 2000, "virtual fans")
 	flag.IntVar(&cfg.Concurrency, "concurrency", 200, "max simultaneous connections")
@@ -34,10 +36,6 @@ func main() {
 	reset := flag.Bool("reset", true, "reset the show's bookings before the run")
 	asJSON := flag.Bool("json", false, "print the raw JSON report")
 	flag.Parse()
-	if cfg.AdminToken == "" {
-		fmt.Fprintln(os.Stderr, "ADMIN_TOKEN must be set (env or ../.env)")
-		os.Exit(2)
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

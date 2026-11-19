@@ -77,7 +77,8 @@ jobs:
       - name: Smoke + load test
         run: |
           cp .env.example .env
-          sed -i "s/=change-me/=ci-$(openssl rand -hex 12)/" .env
+          # CI uses random secrets rather than the public local default
+          sed -i "s/localpassword1234567890/ci$(openssl rand -hex 12)/g" .env
           docker compose up -d --build --wait
           curl -fsS http://localhost:8080/api/health
           cd backend && go run ./cmd/loadtest -url http://localhost:8080 -users 1000 -concurrency 100 -stampede

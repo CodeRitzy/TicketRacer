@@ -1,13 +1,15 @@
 # Whole stack: `docker compose up --build`, then open http://localhost:8080
+# No setup needed: every value has a local default. A .env file (see .env.example) is optional and
+# only needed for Stripe or to change a setting; values in it override the defaults below.
 # Postgres and Redis are published on 127.0.0.1 only (for tests and the load test); never on the network.
 services:
   postgres:
     image: postgres:17-alpine
     # only the database's own settings: the Stripe/admin secrets never enter this container
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:-ticketracer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localpassword1234567890}
+      POSTGRES_DB: ${POSTGRES_DB:-ticketracer}
     ports: ["127.0.0.1:5433:5432"] # 5433 on the host so it never clashes with a local Postgres
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
@@ -17,9 +19,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-localpassword1234567890}"]
     environment:
-      REDISCLI_AUTH: ${REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-localpassword1234567890}
     ports: ["127.0.0.1:6379:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -28,12 +30,19 @@ services:
 
   api:
     build: ./backend
-    env_file: .env
+    # optional: Stripe keys and booking-rule overrides
+    env_file:
+      - path: .env
+        required: false
     environment:
       # inside the compose network the services are reached by name, not localhost
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      DATABASE_URL: postgres://${POSTGRES_USER:-ticketracer}:${POSTGRES_PASSWORD:-localpassword1234567890}@postgres:5432/${POSTGRES_DB:-ticketracer}?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD:-localpassword1234567890}@redis:6379/0
       SELF_URL: http://127.0.0.1:8081
+      # the API accepts this public default only while PUBLIC_URL is localhost
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-localpassword1234567890}
+      DEMO_WEBHOOK_SECRET: ${DEMO_WEBHOOK_SECRET:-localpassword1234567890}
+      PAYMENT_MODE: ${PAYMENT_MODE:-demo}
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
