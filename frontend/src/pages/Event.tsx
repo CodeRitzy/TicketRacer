@@ -81,7 +81,7 @@ export function Event({ showId }: { showId: number }) {
           <div><dt>Status</dt><dd><span className={`status status--${status.tone ?? 'ok'}`}>{status.text || '–'}</span></dd></div>
         </dl>
         <p className="dim fine">
-          Demo show: the act is fictional. {show?.payment_mode === 'stripe'
+          Demo show: the performer is fictional. {show?.payment_mode === 'stripe'
             ? 'Payments run in Stripe test mode: use card 4242 4242 4242 4242, any future date, any CVC.'
             : 'Payments use the built-in test checkout; no card needed.'}
         </p>

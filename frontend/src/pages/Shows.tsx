@@ -41,10 +41,24 @@ export function Shows() {
   const [shape, setShape] = useState<SwarmShape>('house')
   const [tick, setTick] = useState(0)
 
-  // load the state list, then start from the remembered choice or the time-zone guess
-  useEffect(() => {
-    api.states().then((list) => { setStates(list); setCode(rememberedState(list)) }, () => setError('Could not load states.'))
-  }, [])
+  const [fallback, setFallback] = useState(false)
+
+  // load the state list, then start from the remembered choice, the time-zone guess, or California.
+  // A failed request (say the API is still starting) retries every 3 s instead of leaving the page empty.
+  usePoll(async () => {
+    try {
+      const list = await api.states()
+      const start = rememberedState(list)
+      setStates(list)
+      setCode(start.code)
+      setFallback(start.fallback)
+      setError('')
+      return true
+    } catch (e) {
+      setError('Could not reach the server. Retrying…')
+      throw e
+    }
+  }, 3000, !states.length)
 
   // the lineup refreshes every 5 s so availability and remarks stay honest
   usePoll(async () => {
@@ -74,6 +88,7 @@ export function Shows() {
     rememberState(next)
     setShows(null)
     setCode(next)
+    setFallback(false)
   }
   const stateName = states.find((s) => s.code === code)?.name ?? ''
   // the featured show: the soonest one still on sale (a sold-out house makes a dull sculpture)
@@ -129,6 +144,7 @@ export function Shows() {
                 Six upcoming shows at real {stateName || 'local'} venues. Thousands of fans, a few hundred seats,
                 and not one seat ever sold twice.
               </p>
+              {fallback && <p className="scene__caption">We couldn't tell where you are, so these are California shows. Tap the state name to see any other state.</p>}
               {next && <p className="scene__caption">Each dot is a seat at {next.act}, live.</p>}
             </div>
           </div>
@@ -178,7 +194,7 @@ export function Shows() {
         <div className="glass lineup">
           <table className="departures" aria-label={`Upcoming shows in ${stateName}`}>
             <thead>
-              <tr><th scope="col">Date</th><th scope="col">Act</th><th scope="col">Venue</th>
+              <tr><th scope="col">Date</th><th scope="col">Show</th><th scope="col">Venue</th>
                 <th scope="col" className="col-from">From</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Open</span></th></tr>
             </thead>
             <tbody>
@@ -201,7 +217,7 @@ export function Shows() {
           </table>
         </div>
         <p className="dim fine">
-          Demo shows: every act is fictional. Venues and capacities are real; section layouts use the venue's published
+          Demo shows: every show is fictional. Venues and capacities are real; section layouts use the venue's published
           names where they exist and the venue type's usual layout otherwise; prices are typical for the venue type.
           Your state is guessed from your device's time zone and never leaves this browser.
         </p>

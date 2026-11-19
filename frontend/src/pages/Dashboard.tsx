@@ -33,7 +33,7 @@ function Gate({ onOk }: { onOk: () => void }) {
   return (
     <main id="main" className="ticket">
       <h1 className="section__title">Operations</h1>
-      <p className="dim">The dashboard and simulator need the admin token, the <span className="mono">ADMIN_TOKEN</span> value in your <span className="mono">.env</span>.</p>
+      <p className="dim">The dashboard and simulator need the admin token. Running locally without a <span className="mono">.env</span>, it is <span className="mono">localpassword1234567890</span>; otherwise use your <span className="mono">ADMIN_TOKEN</span>.</p>
       <form className="form" onSubmit={submit} style={{ maxWidth: 480 }}>
         <div className="field">
           <label htmlFor="admin-token">Admin token</label>

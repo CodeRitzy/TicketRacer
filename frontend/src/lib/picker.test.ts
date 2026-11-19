@@ -64,9 +64,13 @@ describe('guessState', () => {
     expect(guessState(states, 'America/Denver')).toBe('CO')
     expect(guessState(states, 'America/Chicago')).toBe('IL')
   })
-  it('handles sub-zones and falls back to New York', () => {
+  it('handles sub-zones', () => {
     expect(guessState(states, 'America/Indiana/Knox')).toBe('IN')
-    expect(guessState(states, 'Europe/Paris')).toBe('NY')
+  })
+  it('returns null when the location is unknown, so the page can fall back to California', () => {
+    expect(guessState(states, 'Europe/Paris')).toBeNull()
+    expect(guessState(states, 'UTC')).toBeNull()
+    expect(guessState(states, undefined)).toBeNull()
   })
 })
 

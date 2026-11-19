@@ -26,24 +26,35 @@ const PREFIXES: [string, string][] = [
   ['America/North_Dakota/', 'ND'],
 ]
 
-export function guessState(states: StateInfo[], zone: string): string {
+// when the location can't be told (non-US or hidden time zone), the page opens on California
+export const FALLBACK_STATE = 'CA'
+
+// guessState maps a time zone to a state, or null when the zone isn't a US one we know.
+export function guessState(states: StateInfo[], zone: string | undefined): string | null {
+  if (!zone) return null
   const has = (code: string) => states.some((s) => s.code === code)
   const preferred = PREFERRED[zone]
   if (preferred && has(preferred)) return preferred
   const prefix = PREFIXES.find(([p]) => zone.startsWith(p))
   if (prefix && has(prefix[1])) return prefix[1]
-  return states.find((s) => s.zone === zone)?.code ?? 'NY'
+  return states.find((s) => s.zone === zone)?.code ?? null
 }
 
 const KEY = 'tr.state'
 
 // rememberedState: the visitor's own choice wins over the guess (kept in localStorage only).
-export function rememberedState(states: StateInfo[]): string {
+// `fallback` is true when neither told us where they are, so the page can say so.
+export function rememberedState(states: StateInfo[]): { code: string; fallback: boolean } {
   try {
     const saved = localStorage.getItem(KEY)
-    if (saved && states.some((s) => s.code === saved)) return saved
+    if (saved && states.some((s) => s.code === saved)) return { code: saved, fallback: false }
   } catch { /* storage blocked: fall through to the guess */ }
-  return guessState(states, Intl.DateTimeFormat().resolvedOptions().timeZone)
+  let zone: string | undefined
+  try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone } catch { /* no Intl time zone support */ }
+  const guess = guessState(states, zone)
+  if (guess) return { code: guess, fallback: false }
+  const fallback = states.some((s) => s.code === FALLBACK_STATE) ? FALLBACK_STATE : states[0]?.code ?? ''
+  return { code: fallback, fallback: true }
 }
 
 export function rememberState(code: string) {
